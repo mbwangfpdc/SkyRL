@@ -4,36 +4,45 @@ set -x
 # Uses 1 node with 8 GPUs.
 # hf download NovaSky-AI/SkyRL-SQL-653-data-newfmt --local-dir $HOME/data/sql --repo-type dataset
 # export WANDB_API_KEY=<your_key_here>
-# bash examples/train/text_to_sql/run_skyrl_sql.sh
 
 # change these paths to your own
-DATA_DIR="$HOME/data/sql"
-DB_PATH="$HOME/data/sql/db_files/data"
-CKPT_PATH="$HOME/ckpts/skyrl_sql_7B_ckpt"
+DATA_DIR="/local_nvme1/nmodugul/text2sql-data"
+DB_PATH="/local_nvme1/nmodugul/text2sql-data/data"
+CKPT_PATH="/local_nvme1/mborjigi/tmp/ckpts/sql_7B_ckpt"
 
-NUM_GPUS=8
-NUM_INFERENCE_ENGINES=2
-TP_SIZE=4
+NUM_TRAINING_GPUS=4
+NUM_INFERENCE_ENGINES=4
+TP_SIZE=1
+DP_SIZE=1
+# NUM_TRAINING_GPUS=1
+# NUM_INFERENCE_ENGINES=1
+# TP_SIZE=1
 MAX_INPUT_LENGTH=29000
 MAX_GENERATE_LENGTH=3000
-TRAIN_BATCH_SIZE=256
+TRAIN_BATCH_SIZE=64
 
-uv run --isolated --extra fsdp -m skyrl.train.entrypoints.main_base \
+MODEL=Qwen/Qwen2.5-Coder-7B-Instruct
+
+# uv run --isolated --extra vllm -m examples.async.main_async \
+# uv run --isolated --extra vllm --with torchao -m skyrl_train.entrypoints.main_base \
+uv run --active --extra fsdp -m skyrl.train.entrypoints.main_base \
   trainer.algorithm.advantage_estimator="grpo" \
   data.train_data="['$DATA_DIR/train.parquet']" \
   data.val_data="['$DATA_DIR/validation.parquet']" \
-  trainer.policy.model.path="Qwen/Qwen2.5-Coder-7B-Instruct" \
-  trainer.epochs=30 \
+  trainer.policy.model.path=$MODEL \
+  trainer.epochs=3 \
   trainer.placement.colocate_all=true \
   trainer.strategy=fsdp2 \
   trainer.policy.fsdp_config.cpu_offload=false \
+  trainer.policy.fsdp_config.wrap_policy.num_model_units=-1 \
   trainer.ref.fsdp_config.cpu_offload=true \
   trainer.policy.optimizer_config.max_grad_norm=0.5 \
   trainer.policy.sequence_parallel_size=1 \
-  trainer.placement.policy_num_gpus_per_node=$NUM_GPUS \
-  trainer.placement.ref_num_gpus_per_node=$NUM_GPUS \
+  trainer.placement.policy_num_gpus_per_node=$NUM_TRAINING_GPUS \
+  trainer.placement.ref_num_gpus_per_node=$NUM_TRAINING_GPUS \
   generator.inference_engine.num_engines=$NUM_INFERENCE_ENGINES \
   generator.inference_engine.tensor_parallel_size=$TP_SIZE \
+  generator.inference_engine.data_parallel_size=$DP_SIZE \
   trainer.train_batch_size=$TRAIN_BATCH_SIZE \
   trainer.micro_forward_batch_size_per_gpu=8 \
   trainer.micro_train_batch_size_per_gpu=1 \
@@ -41,10 +50,10 @@ uv run --isolated --extra fsdp -m skyrl.train.entrypoints.main_base \
   generator.max_input_length=$MAX_INPUT_LENGTH \
   generator.sampling_params.max_generate_length=$MAX_GENERATE_LENGTH \
   trainer.policy.optimizer_config.lr=1.0e-6 \
-  trainer.policy_mini_batch_size=256 \
+  trainer.policy_mini_batch_size=$TRAIN_BATCH_SIZE \
   trainer.algorithm.use_kl_loss=false \
-  trainer.ckpt_interval=60 \
-  trainer.hf_save_interval=30 \
+  trainer.ckpt_interval=-1 \
+  trainer.hf_save_interval=-1 \
   trainer.dump_data_batch=true \
   generator.inference_engine.backend=vllm \
   generator.inference_engine.run_engines_locally=true \
@@ -54,7 +63,7 @@ uv run --isolated --extra fsdp -m skyrl.train.entrypoints.main_base \
   environment.env_class=text2sql \
   generator.use_conversation_multi_turn=false \
   generator.n_samples_per_prompt=5 \
-  generator.inference_engine.gpu_memory_utilization=0.7 \
+  generator.inference_engine.gpu_memory_utilization=0.9 \
   generator.max_turns=6 \
   generator.sampling_params.temperature=0.6 \
   generator.sampling_params.top_p=0.95 \
@@ -62,12 +71,16 @@ uv run --isolated --extra fsdp -m skyrl.train.entrypoints.main_base \
   generator.eval_sampling_params.stop='["</sql>", "</solution>"]' \
   generator.eval_sampling_params.max_generate_length=$MAX_GENERATE_LENGTH \
   environment.skyrl_gym.text2sql.db_path=$DB_PATH \
-  trainer.logger="wandb" \
+  trainer.logger="console" \
   trainer.project_name="skyrlsql" \
   trainer.run_name="skyrlsql_repro" \
-  trainer.resume_mode=latest \
+  trainer.resume_mode=none \
   trainer.ckpt_path=$CKPT_PATH \
   trainer.eval_batch_size=1024 \
-  trainer.eval_before_train=true \
-  trainer.eval_interval=5 \
+  trainer.eval_before_train=false \
+  trainer.eval_interval=-1 \
   $@
+
+# +generator.engine_init_kwargs.max_model_len=25000 \
+# generator.max_num_seqs=32 \
+# generator.enforce_eager=false \

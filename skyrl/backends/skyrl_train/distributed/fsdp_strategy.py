@@ -19,6 +19,10 @@ from torch.distributed.fsdp import CPUOffload, MixedPrecision
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers.trainer import get_scheduler
 
+from skyrl.train.utils import (
+    Timer,
+    time_func,
+)
 from skyrl.backends.skyrl_train.distributed.fsdp_utils import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
@@ -117,6 +121,7 @@ class FSDPStrategy(DistributedStrategy):
 
         self.device_mesh = create_device_mesh(world_size=self.world_size, fsdp_size=self.fsdp_config.fsdp_size)
 
+    @time_func("FSDPStrategy.offload_to_cpu")
     def offload_to_cpu(
         self, model, optimizer, pin_memory=True, non_blocking=True, offload_optimizer=True, offload_model=True
     ):
@@ -140,6 +145,7 @@ class FSDPStrategy(DistributedStrategy):
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
+    @time_func("FSDPStrategy.backload_to_gpu")
     def backload_to_gpu(self, model, optimizer, non_blocking=True, backload_optimizer=True, backload_model=True):
         """Reload model weights back to GPU."""
         if isinstance(model, HFModelWrapper):
@@ -156,10 +162,12 @@ class FSDPStrategy(DistributedStrategy):
 
         torch.cuda.synchronize()
 
+    @time_func("FSDPStrategy.backward")
     def backward(self, loss: torch.Tensor, model, optimizer: optim.Optimizer, **kwargs) -> None:
         """Perform backward pass"""
         loss.backward()
 
+    @time_func("FSDPStrategy.optimizer_step")
     def optimizer_step(
         self,
         optimizer: optim.Optimizer,
@@ -198,6 +206,7 @@ class FSDPStrategy(DistributedStrategy):
         optimizer.zero_grad()
         return grad_norm
 
+    @time_func("FSDPStrategy.prepare")
     def prepare(
         self, *models_or_model_optim_pairs: ModelOrModelOptimPair
     ) -> Union[List[ModelOrModelOptimPair], ModelOrModelOptimPair]:
@@ -212,7 +221,9 @@ class FSDPStrategy(DistributedStrategy):
 
         return ret[0] if len(ret) == 1 else ret
 
-    def _fsdp_init_model(self, model, is_train=True, is_wrapped=False):
+    @time_func("FSDPStrategy._fsdp_init_model")
+    def _fsdp_init_model(self, model, is_train=True, is_wrapped=False) -> FSDP:
+        logger.info(f"FSDP config is: {self.fsdp_config}")
         # Initialize FSDP wrapping policy
         wrap_policy = get_fsdp_wrap_policy(
             module=model.model if is_wrapped else model,
@@ -282,6 +293,7 @@ class FSDPStrategy(DistributedStrategy):
 
         return fsdp_module
 
+    @time_func("FSDPStrategy._fsdp_init_train_model")
     def _fsdp_init_train_model(self, model, optimizer, scheduler):
         """Initialize a model for training with FSDP"""
         is_wrapped = isinstance(model, HFModelWrapper)
@@ -295,6 +307,21 @@ class FSDPStrategy(DistributedStrategy):
                 betas=optim_config.adam_betas,
                 weight_decay=optim_config.weight_decay,
             )
+            # try:
+            #     # The standard v0.9 path
+            #     from torchao.prototype.low_bit_optim import CPUOffloadOptimizer
+            # except ImportError:
+            #     # Sometimes it wasn't exposed in the __init__, so try the file directly
+            #     from torchao.prototype.low_bit_optim.cpu_offload import CPUOffloadOptimizer
+            # new_optimizer = CPUOffloadOptimizer(
+            #     fsdp_module.parameters(),
+            #     optimizer_class=optim.AdamW,
+            #     lr=optim_config.lr,
+            #     betas=optim_config.adam_betas,
+            #     weight_decay=optim_config.weight_decay,
+            #     # TODO: debugging this
+            #     offload_gradients=True  
+            # )
 
             lr_scheduler = get_scheduler(
                 optim_config.scheduler,
@@ -403,6 +430,7 @@ class FSDPStrategy(DistributedStrategy):
 
         dist.barrier()
 
+    @time_func("FSDPStrategy.save_checkpoint")
     def save_checkpoint(
         self,
         model,
@@ -512,6 +540,7 @@ class FSDPStrategy(DistributedStrategy):
         torch.cuda.synchronize()
         self.print(f"[rank-{rank}]: Checkpoint saved to {ckpt_dir}")
 
+    @time_func("FSDPStrategy.load_checkpoint")
     def load_checkpoint(
         self,
         model,
@@ -623,6 +652,7 @@ class FSDPStrategy(DistributedStrategy):
         return ckpt_dir, states
 
     # TODO (erictang000): Test in multi-node setting
+    @time_func("FSDPStrategy.save_hf_model")
     def save_hf_model(self, model: Union[HFModelWrapper, nn.Module], output_dir: str, tokenizer=None, **kwargs) -> None:
         """Save model in HuggingFace safetensors format using FSDP's full state dict gathering"""
 

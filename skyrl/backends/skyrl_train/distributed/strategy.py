@@ -9,6 +9,7 @@ from jaxtyping import Float
 from loguru import logger
 from torch import distributed as dist
 from transformers import GenerationConfig, PretrainedConfig, PreTrainedTokenizer
+from skyrl.train.utils import time_func
 
 from skyrl.backends.skyrl_train.utils.io import io
 
@@ -67,6 +68,7 @@ class DistributedStrategy(ABC):
         """Get current process rank"""
         return dist.get_rank()
 
+    # @time_func("DistributedStrategy.all_reduce")
     def all_reduce(self, data: DataT, op="mean", group=None) -> DataT:
         """Perform all_reduce across all processes (or within a process group)."""
         assert op in ("mean", "max", "sum", "min")
@@ -95,6 +97,7 @@ class DistributedStrategy(ABC):
                 data = data.cpu()
             return data.item() if not is_tensor else data
 
+    # @time_func("DistributedStrategy.all_gather")
     def all_gather(self, data: DataT) -> DataT:
         """Perform all_gather across all processes"""
         if isinstance(data, dict):

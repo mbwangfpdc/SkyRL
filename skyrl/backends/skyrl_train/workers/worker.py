@@ -35,13 +35,27 @@ from skyrl.backends.skyrl_train.distributed.ulysses import (
     apply_monkey_patch,
     set_ulysses_sequence_parallel_group,
 )
+# <<<<<<< /local_ssd1/mborjigi/skyrl/SkyRL/skyrl/backends/skyrl_train/workers/worker.py
 from skyrl.backends.skyrl_train.inference_engines.inference_engine_client import (
     InferenceEngineClient,
+# =======
+# from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
+# from skyrl_train.env_vars import _SKYRL_USE_NEW_INFERENCE
+# from skyrl_train.training_batch import TrainingInputBatch, TrainingOutputBatch, tensor_to_strings
+# from skyrl_train.utils import (
+#     Timer,
+#     time_func,
+#     get_ray_pg_ready_with_timeout,
+#     get_reordered_bundle_indices,
+#     ray_noset_visible_devices,
+# >>>>>>> /local_ssd1/mborjigi/skyrl/SkyRL/skyrl/backends/skyrl_train/workers/OLD_worker.py
 )
 from skyrl.backends.skyrl_train.training_batch import (
     TrainingInputBatch,
     TrainingOutputBatch,
+    tensor_to_strings
 )
+from skyrl.backends.skyrl_train.utils.profiler import profile
 from skyrl.backends.skyrl_train.utils.io import io
 from skyrl.backends.skyrl_train.utils.ppo_utils import (
     PolicyLossRegistry,
@@ -66,6 +80,8 @@ from skyrl.train.utils.utils import (
     configure_ray_worker_logging,
     get_ray_pg_ready_with_timeout,
     ray_noset_visible_devices,
+    Timer,
+    time_func,
 )
 
 _SET_AFFINITY = False
@@ -370,6 +386,7 @@ class Worker(DistributedTorchRayActor):
 
         torch.distributed.barrier()
 
+    # @time_func("Worker.forward")
     def forward(
         self,
         data: TrainingInputBatch,
@@ -384,10 +401,16 @@ class Worker(DistributedTorchRayActor):
 
         outputs = []
         for micro_batch in micro_batches:
+            timers = [Timer(f"forward_traj_{uid}") for uid in tensor_to_strings(micro_batch["trajectory_ids"])]
+            for timer in timers:
+                timer.__enter__()
             outputs.append(self._forward_micro_batch(micro_batch))
+            for timer in timers:
+                timer.__exit__(None, None, None)
         output = TrainingOutputBatch.cat(outputs)
         if output.device is not None and output.device != torch.device("cpu"):
-            output = output.to("cpu")
+            with Timer("forward_output_move"):
+                output = output.to("cpu")
         return output
 
     def _forward_micro_batch(self, micro_batch: TrainingInputBatch) -> TrainingOutputBatch:
@@ -676,6 +699,7 @@ class PolicyWorkerBase(Worker):
         self.mesh_rank: MeshRank = None
         self.policy_loss_fn: Callable = PolicyLossRegistry.get(self.cfg.algorithm.policy_loss_type)
 
+    # @time_func("PolicyWorkerBase.forward_backward")
     def forward_backward(
         self,
         data: TrainingInputBatch,
@@ -702,18 +726,24 @@ class PolicyWorkerBase(Worker):
         all_metrics = defaultdict(list)
         all_loss_fn_outputs = []  # Handle separately from scalar metrics
 
-        for micro_batch in BatchIterator(data, micro_batch_size, drop_last=False):
-            microbatch_weight = micro_batch_size / len(data)
-            metrics = self._forward_backward_micro(
-                micro_batch, microbatch_weight, loss_fn=loss_fn, loss_fn_config=loss_fn_config
-            )
+        for i, micro_batch in enumerate(BatchIterator(data, micro_batch_size, drop_last=False)):
+            def do_step():
+                microbatch_weight = micro_batch_size / len(data)
+                metrics = self._forward_backward_micro(
+                    micro_batch, microbatch_weight, loss_fn=loss_fn, loss_fn_config=loss_fn_config
+                )
 
-            # Extract loss_fn_outputs before reduce_metrics (it's not a scalar metric)
-            if "loss_fn_outputs" in metrics:
-                all_loss_fn_outputs.extend(metrics.pop("loss_fn_outputs"))
+                # Extract loss_fn_outputs before reduce_metrics (it's not a scalar metric)
+                if "loss_fn_outputs" in metrics:
+                    all_loss_fn_outputs.extend(metrics.pop("loss_fn_outputs"))
 
-            for k, v in metrics.items():
-                all_metrics[k].append(v)
+                for k, v in metrics.items():
+                    all_metrics[k].append(v)
+            if i < 3:
+                with profile("forward_backward_micro"):
+                    do_step()
+            else:
+                do_step()
 
         # TODO: SFT path still averages metrics across microbatches and workers.
         # This needs to be unified with the RL path which sums.
@@ -753,7 +783,8 @@ class PolicyWorkerBase(Worker):
         """
         self.model.train()
 
-        experience.to_device(torch.cuda.current_device())
+        with Timer("forward_backward_micro__to_device"):
+            experience.to_device(torch.cuda.current_device())
 
         sequences = experience.sequences
         old_action_log_probs = experience.action_log_probs
@@ -790,27 +821,29 @@ class PolicyWorkerBase(Worker):
         # TODO (sumanthrh): don't think this does anything for fsdp rn because autocast happens internally
         with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             # actor loss
-            action_log_probs, output = self.model(
-                sequences,
-                num_actions,
-                attention_mask=attention_mask,
-                temperature=self.cfg.algorithm.temperature,
-                return_output=True,
-                compute_entropy=True,
-                entropy_requires_grad=self.cfg.algorithm.use_entropy_loss,
-                pixel_values=experience.pixel_values,
-                image_grid_thw=experience.image_grid_thw,
-            )
+            with Timer("PolicyWorkerBase._forward_backward_micro__forward"):
+                action_log_probs, output = self.model(
+                    sequences,
+                    num_actions,
+                    attention_mask=attention_mask,
+                    temperature=self.cfg.algorithm.temperature,
+                    return_output=True,
+                    compute_entropy=True,
+                    entropy_requires_grad=self.cfg.algorithm.use_entropy_loss,
+                    pixel_values=experience.pixel_values,
+                    image_grid_thw=experience.image_grid_thw,
+                )
             # loss function
             # TODO: recompute advantages
-            policy_loss, loss_metrics = current_loss_fn(
-                action_log_probs,
-                old_action_log_probs,
-                advantages,
-                config=loss_config,
-                loss_mask=loss_mask,
-                rollout_logprobs=rollout_action_logprobs,
-            )
+            with Timer("PolicyWorkerBase._forward_backward_micro__compute_loss"):
+                policy_loss, loss_metrics = current_loss_fn(
+                    action_log_probs,
+                    old_action_log_probs,
+                    advantages,
+                    config=loss_config,
+                    loss_mask=loss_mask,
+                    rollout_logprobs=rollout_action_logprobs,
+                )
 
         # SFT path: skip KL/entropy terms, return per-token outputs for Tinker API
         if resolved_loss_name == "cross_entropy":
@@ -926,6 +959,7 @@ class PolicyWorkerBase(Worker):
 
         return status
 
+    # @time_func("PolicyWorkerBase.optim_step")
     def optim_step(self) -> float:
         """
         Perform optimizer step.
@@ -934,10 +968,13 @@ class PolicyWorkerBase(Worker):
             The gradient norm (before scaling, after clipping)
         """
         # Perform optimizer step (includes gradient clipping)
+        # No profile since the file is ginormous
+        # with profile("optim_step"):
         grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
 
         if grad_norm is not None:
-            grad_norm = grad_norm.detach().cpu().item()
+            with Timer(f"optim_step__grad_norm_detach"):
+                grad_norm = grad_norm.detach().cpu().item()
         return grad_norm
 
     def get_lr(self) -> float:
@@ -993,6 +1030,7 @@ class PolicyWorkerBase(Worker):
             tokenizer=tokenizer,
         )
 
+    # @time_func("PolicyWorkerBase._forward_micro_batch")
     def _forward_micro_batch(self, micro_batch: TrainingInputBatch) -> TrainingOutputBatch:
         device = torch.cuda.current_device()
         micro_batch.to(device)

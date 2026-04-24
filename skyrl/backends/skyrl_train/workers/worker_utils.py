@@ -119,7 +119,7 @@ class BatchIterator:
             rollout_expert_indices=batch.get("rollout_expert_indices"),
             # additional info
             # can be used to log metrics etc for micro-batches in the worker
-            info={},
+            info={"trajectory_ids": batch.get("trajectory_ids")},
             # propagate metadata as is
             metadata=batch.metadata,
             # Multi-modal vision fields (may be absent for text-only)

@@ -15,6 +15,8 @@ from uuid import uuid4
 import torch
 from loguru import logger
 from tqdm.asyncio import tqdm
+import friendlywords as fw
+fw.preload()
 
 import skyrl_gym
 from skyrl.backends.skyrl_train.inference_engines.base import (
@@ -38,7 +40,23 @@ from skyrl.train.generators.utils import (
     get_rollout_metrics,
 )
 from skyrl_gym.envs.base_text_env import BaseTextEnvStepOutput
+import time
 
+class ContextTimer:
+    def __init__(self, storage_list, name):
+        self.storage_list = storage_list
+        self.name = name
+        self.start_time = None
+
+    def __enter__(self):
+        # Record the start time (wall-clock time)
+        self.start_time = time.time()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        duration = time.time() - self.start_time
+        # Append: (name, start_time_epoch, duration_seconds)
+        self.storage_list.append((self.name, self.start_time, duration))
 
 @dataclass
 class TrajectoryOutput:
@@ -231,6 +249,9 @@ class SkyRLGymGenerator(GeneratorInterface):
         sampling_params: Optional[Dict[str, Any]] = None,
         trajectory_id: Optional[TrajectoryID] = None,
     ) -> Union[TrajectoryOutput, StepWiseOutput]:
+        start = time.time()
+        step_times = []
+        # Step boundaries - first is the start of the first step (i.e. start of agent loop) and last is the end of the last step (i.e. end of agent loop)
         """
         Multi-turn generation loop that executes a single trajectory.
 
@@ -259,16 +280,30 @@ class SkyRLGymGenerator(GeneratorInterface):
         # NOTE: `custom_chat_template` was mainly for getting accurate loss masks for thinking models.
         # This is no longer needed now given that step wise training is supported
         # TODO (sumanthrh): This path can be deprecated
+        log = {
+            # All timers
+            "timers": [],
+            # Per-step details
+            "response_sizes": [],
+            "prompt_sizes": [],
+            "stop_reasons": [],
+            "step_rewards": [],
+            # Also per-step, but only output to stdout for certain suspicious steps we want to debug
+            "prompts": [],
+            "responses": [],
+        }
         retokenize_chat_history = self.use_conversation_multi_turn and self.custom_chat_template
 
         # Create a new environment instance
         env_extras["max_turns"] = self.max_turns  # TODO(shu): move this to config
-        env_config = getattr(self.skyrl_gym_cfg, env_class, dict())
-        env = skyrl_gym.make(env_class, env_config=env_config, extras=env_extras)
+        with ContextTimer(log["timers"], f"env_make"):
+            env_config = getattr(self.skyrl_gym_cfg, env_class, dict())
+            env = skyrl_gym.make(env_class, env_config=env_config, extras=env_extras)
 
         session_id = (
-            f"{trajectory_id.instance_id}_{trajectory_id.repetition_id}" if trajectory_id is not None else uuid4().hex
+            trajectory_id.to_string() if trajectory_id is not None else uuid4().hex
         )
+        done = False
 
         # Instantiate chat_history and chat_end_index, which are only used if `retokenize_chat_history==True`.
         # Need copy here since the prompt is a list of messages and we are going to modify it.
@@ -314,12 +349,13 @@ class SkyRLGymGenerator(GeneratorInterface):
             response_end_idx=None,
             done=False,
         )
-
+        step = 0
         while not agent_loop_state.done:
-
+            step += 1
             if len(agent_loop_state.input_ids) > max_input_length:
                 stop_reason = "length"
                 break
+            log["prompt_sizes"].append(len(agent_loop_state.input_ids))
 
             # 1. Generate output
             if is_step_wise or retokenize_chat_history:
@@ -338,9 +374,18 @@ class SkyRLGymGenerator(GeneratorInterface):
             engine_input = InferenceEngineInput(
                 prompt_token_ids=[agent_loop_state.input_ids], session_ids=[session_id], sampling_params=sampling_params
             )
-            engine_output = await self.inference_engine_client.generate(engine_input)
+            generate_start = time.time()
+            with ContextTimer(log["timers"], f"engine_generate"):
+                engine_output = await self.inference_engine_client.generate(engine_input)
+            step_times.append(time.time() - generate_start)
+            # logger.info(f"{session_id}:{step} took {time.time() - generate_start:.2f}s")
+            log["prompts"].append(prompt)
+            if session_id == "0_0":
+                logger.info(f"Debug log for session {session_id}, step {step}: prompt: {prompt}, engine_output: {engine_output}")
             output = engine_output["responses"][0]
+            log["responses"].append(output)
             output_ids = engine_output["response_ids"][0]
+            log["response_sizes"].append(len(output_ids))
             stop_reason = engine_output["stop_reasons"][0]
             response_logprobs = engine_output.get("response_logprobs", None)
             rollout_expert_indices = engine_output.get("rollout_expert_indices", None)
@@ -348,6 +393,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                 response_logprobs = response_logprobs[0]
                 if self.custom_chat_template is not None:
                     raise ValueError("Response Logprobs bookkeeping is not supported with custom chat template")
+            log["stop_reasons"].append(stop_reason)
 
             if rollout_expert_indices is not None:
                 rollout_expert_indices = rollout_expert_indices[0]
@@ -374,6 +420,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             new_obs = env_step_output["observations"]
             step_reward: float = env_step_output["reward"]
             agent_loop_state.done = env_step_output["done"]
+            log["step_rewards"].append(step_reward)
 
             if env_step_output.get("postprocessed_action", None) is not None:
                 # TODO(Charlie): come back to this, we should deprecate postprocessed action
@@ -442,9 +489,10 @@ class SkyRLGymGenerator(GeneratorInterface):
             per_step_rewards.append((step_reward, agent_loop_state.response_end_idx))
 
         # Get environment-specific metrics after the episode is done
-        env_metrics = env.get_metrics()
-        # Close the environment
-        await self._run_in_executor_if_available(env.close)
+        with ContextTimer(log["timers"], f"env_wrapup"):
+            env_metrics = env.get_metrics()
+            # Close the environment
+            await self._run_in_executor_if_available(env.close)
 
         prompt_ids = agent_loop_state.input_ids[:initial_prompt_length]
         rollout_logprobs = None
@@ -524,6 +572,15 @@ class SkyRLGymGenerator(GeneratorInterface):
                 env_metrics=env_metrics,
                 rollout_expert_indices=rollout_expert_indices_out,
             )
+        # Picking some arbitrary sessions to log full details to stdout for debugging
+        # if any(rsize == 3000 for rsize in log["response_sizes"]):
+        #     log["prompts"] = []
+        #     log["responses"] = []
+
+        # import json
+        # print(f"{session_id} log: !@#${json.dumps(log)}!@#$")
+        
+        logger.info(f"Agent loop {session_id} took {time.time() - start:.2f}s, steps: {','.join([f'{t:.2f}' for t in step_times])}, stop reason {stop_reason}")
 
         return agent_loop_output
 
@@ -804,7 +861,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             prompt_token_ids = [output.prompt_ids for output in all_outputs]
             env_metrics = [output.env_metrics for output in all_outputs]
             is_last_step = None
-            out_trajectory_ids = None
+            out_trajectory_ids = trajectory_ids
 
         has_vision_features = any(getattr(output, "pixel_values", None) is not None for output in all_outputs)
         pixel_values = (

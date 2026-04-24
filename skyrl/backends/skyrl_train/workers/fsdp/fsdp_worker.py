@@ -47,7 +47,12 @@ from skyrl.backends.skyrl_train.workers.worker import (
     PolicyWorkerBase,
     RefWorkerBase,
 )
-from skyrl.train.utils.utils import str_to_torch_dtype
+from skyrl.train.utils import (
+    Timer,
+    time_func,
+    str_to_torch_dtype
+)
+from loguru import logger
 
 if TYPE_CHECKING:
     from skyrl.train.config.config import InferenceEngineConfig
@@ -161,6 +166,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
     def backload_to_gpu(self, non_blocking=True, backload_optimizer=True, backload_model=True):
         self.strategy.backload_to_gpu(self.model, self.optimizer, non_blocking, backload_optimizer, backload_model)
 
+    @time_func("FSDPPolicyWorkerBase.init_model")
     def init_model(self, model_path, num_training_steps: int = None):
         assert self.cfg.strategy in ("fsdp", "fsdp2")
         strategy = FSDPStrategy(
@@ -290,6 +296,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         # Check if this is a LoRA model
         peft_model = getattr(self.model.model, "_fsdp_wrapped_module", self.model.model)
 
+        logger.info("Running weight transfer...")
         if self._is_lora:
             assert hasattr(peft_model, "peft_config"), "LoRA model should have peft_config"
 
@@ -306,8 +313,10 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             )
 
         if cache_reset_task is not None:
+            logger.info("Waiting for prefix cache reset...")
             await cache_reset_task
         torch.cuda.empty_cache()
+        logger.info("Distributed barrier...")
         torch.distributed.barrier()
 
     def get_weight_statistics(self):
@@ -318,6 +327,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         # NOTE (sumanthrh): self.model -> HFModelWrapper; self.model.model -> AutoModelForCausalLM
         self.model.model.config.pad_token_id = pad_token_id
 
+    @time_func("FSDPPolicyWorkerBase.forward")
     def forward(
         self,
         data: TrainingInputBatch,

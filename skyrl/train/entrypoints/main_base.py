@@ -170,6 +170,7 @@ class BasePPOExp:
             tokenizer=self.tokenizer,
             max_prompt_length=self.cfg.trainer.max_prompt_length,
             num_workers=8,
+            batch_size=self.cfg.trainer.train_batch_size,
         )
         # make sure the dataset is large enough to train on
         assert (

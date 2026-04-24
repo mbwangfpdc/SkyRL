@@ -95,6 +95,7 @@ class InferenceEngineClient(InferenceEngineInterface):
         prompt_token_ids = input_batch.get("prompt_token_ids")
         session_ids = input_batch.get("session_ids")
         sampling_params = input_batch.get("sampling_params")
+        logger.info(f"Received generate() request with {session_ids=}, {len(prompts) if prompts else 0} prompts")
 
         if (prompts is None and prompt_token_ids is None) or (prompts is not None and prompt_token_ids is not None):
             raise ValueError("Either `prompts` or `prompt_token_ids` must be provided, but not both.")
@@ -125,7 +126,9 @@ class InferenceEngineClient(InferenceEngineInterface):
             engine_input = InferenceEngineInput(
                 prompt_token_ids=cur_prompt_token_ids,
                 sampling_params=sampling_params,
+                session_ids=[session_ids[i] for i in prompt_ids] if session_ids is not None else None,
             )
+            logger.info(f"Scheduling generate() for engine {engine_idx} with InferenceEngineInput {engine_input}")
             tasks.append(asyncio.create_task(self.engines[engine_idx].generate(engine_input)))
             indices_list.append(prompt_ids)
 
@@ -245,6 +248,7 @@ class InferenceEngineClient(InferenceEngineInterface):
         prompt: Union[List[List[int]], List[str]] = ret[1]
         if isinstance(session_id_list, ErrorResponse):
             return session_id_list.model_dump()
+        logger.info(f"Received completion() request with {session_id_list=}, {len(prompt) if prompt else 0} prompts")
 
         num_prompts = len(prompt)
         num_inference_engines = len(self.engines)

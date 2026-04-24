@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import ray
+import asyncio
 from ray import ObjectRef
 
 from skyrl.backends.skyrl_train.distributed.dispatch import (
@@ -27,6 +28,7 @@ from skyrl.backends.skyrl_train.training_batch import (
 )
 from skyrl.backends.skyrl_train.workers.worker import PPORayActorGroup
 from skyrl.train.config import SkyRLTrainConfig
+from skyrl.train.utils import Timer, time_func
 
 
 @dataclass
@@ -97,7 +99,8 @@ class WorkerDispatch:
             return [m for m in ["policy", "ref"] if m in self._actor_groups]
         return [model]
 
-    def _ensure_on_gpu(self, model: str, need_optimizer: bool = True, need_model: bool = True) -> None:
+    @time_func("WorkerDispatch._ensure_on_gpu")
+    async def _ensure_on_gpu(self, model: str, need_optimizer: bool = True, need_model: bool = True) -> None:
         """Ensure model is on GPU, offloading others in same colocation group if needed."""
         if not self._should_manage_offload(model):
             return
@@ -106,40 +109,54 @@ class WorkerDispatch:
             return
 
         group = self._get_colocation_group(model)
+        
+        offload_tasks = []
 
         # Offload others in the same colocation group
         for other in group:
             if other != model and other in self._actor_groups:
                 state = self._gpu_state[other]
                 if state.model_on_gpu or state.optimizer_on_gpu:
-                    self._actor_groups[other].offload_to_cpu()
+                    offload_tasks.extend(self._actor_groups[other].offload_to_cpu(nonblocking=True))
                     self._gpu_state[other] = GPUState()
+        
+        if offload_tasks:
+            await asyncio.gather(*offload_tasks)
 
         # Backload requested model
         state = self._gpu_state[model]
         needs_backload = (need_model and not state.model_on_gpu) or (need_optimizer and not state.optimizer_on_gpu)
 
+        backload_tasks = []
         if needs_backload:
-            self._actor_groups[model].backload_to_gpu(
-                backload_optimizer=need_optimizer,
-                backload_model=need_model,
+            backload_tasks.extend(
+                self._actor_groups[model].backload_to_gpu(
+                    backload_optimizer=need_optimizer,
+                    backload_model=need_model,
+                    nonblocking=True,
+                )
             )
             if need_model:
                 self._gpu_state[model].model_on_gpu = True
             if need_optimizer:
                 self._gpu_state[model].optimizer_on_gpu = True
 
-    def _offload(self, model: str, offload_optimizer: bool = True, offload_model: bool = True) -> None:
+        if backload_tasks:
+            await asyncio.gather(*backload_tasks)
+
+    @time_func("WorkerDispatch._offload")
+    async def _offload(self, model: str, offload_optimizer: bool = True, offload_model: bool = True) -> None:
         """Offload model to CPU."""
         if not self._should_manage_offload(model):
             return
 
         if model not in self._actor_groups:
             return
-
-        self._actor_groups[model].offload_to_cpu(
+            
+        tasks = self._actor_groups[model].offload_to_cpu(
             offload_optimizer=offload_optimizer,
             offload_model=offload_model,
+            nonblocking=True,
         )
 
         if offload_model:
@@ -147,17 +164,21 @@ class WorkerDispatch:
         if offload_optimizer:
             self._gpu_state[model].optimizer_on_gpu = False
 
+        if tasks:
+            await asyncio.gather(*tasks)
+
     def mark_all_offloaded(self) -> None:
         """Mark all models as offloaded (call after build_models when colocate_all)."""
         for model in self._actor_groups:
             self._gpu_state[model] = GPUState()
 
-    def forward(self, model: str, data: TrainingInputBatch) -> TrainingOutputBatch:
+    @time_func("WorkerDispatch.forward")
+    async def forward(self, model: str, data: TrainingInputBatch) -> TrainingOutputBatch:
         """Run inference forward pass. Only loads model (not optimizer)."""
-        self._ensure_on_gpu(model, need_optimizer=False, need_model=True)
+        await self._ensure_on_gpu(model, need_optimizer=False, need_model=True)
 
         refs = self._actor_groups[model].async_run_ray_method("mesh", "forward", data=data)
-        results = ray.get(refs)
+        results = await asyncio.gather(*refs)
 
         output = concatenate_outputs_after_mesh_dispatch(self._actor_groups[model].actor_infos, results)
         return output
@@ -185,7 +206,8 @@ class WorkerDispatch:
         dp_size = self._actor_groups[model].actor_infos[0].rank.dp_size
         return MeshDispatch.stage_chunks(dp_size, data, mini_batch_boundaries)
 
-    def forward_backward(
+    @time_func("WorkerDispatch.forward_backward")
+    async def forward_backward(
         self,
         model: str,
         data: TrainingInputBatch,
@@ -205,7 +227,7 @@ class WorkerDispatch:
         Returns:
             Dictionary of training metrics
         """
-        self._ensure_on_gpu(model, need_optimizer=True, need_model=True)
+        await self._ensure_on_gpu(model, need_optimizer=True, need_model=True)
 
         # Only pass kwargs that are not None (critic worker doesn't accept loss_fn)
         kwargs = {}
@@ -215,9 +237,9 @@ class WorkerDispatch:
             kwargs["loss_fn_config"] = loss_fn_config
 
         refs = self._actor_groups[model].async_run_ray_method("mesh", "forward_backward", data, **kwargs)
-        statuses = ray.get(refs)
+        statuses = await asyncio.gather(*refs)
 
-        self._save_memory_snapshot(model, "forward_backward")
+        await self._save_memory_snapshot(model, "forward_backward")
 
         # With DP>1, each rank returns loss_fn_outputs for its data chunk.
         # Concatenate them in rank order to get the full batch's outputs.
@@ -232,7 +254,7 @@ class WorkerDispatch:
 
         return statuses[0]
 
-    def forward_backward_from_staged(
+    async def forward_backward_from_staged(
         self,
         model: str,
         chunk_refs: List[ObjectRef],
@@ -252,7 +274,7 @@ class WorkerDispatch:
         Returns:
             Aggregated metrics dict from training
         """
-        self._ensure_on_gpu(model, need_optimizer=True, need_model=True)
+        await self._ensure_on_gpu(model, need_optimizer=True, need_model=True)
 
         # Only pass kwargs that are not None (critic worker doesn't accept loss_fn)
         kwargs = {}
@@ -267,45 +289,55 @@ class WorkerDispatch:
             chunk_refs=chunk_refs,
             **kwargs,
         )
-        statuses = ray.get(refs)
+        statuses = await asyncio.gather(*refs)
 
-        self._save_memory_snapshot(model, "forward_backward")
+        await self._save_memory_snapshot(model, "forward_backward")
         return statuses[0]
 
-    def optim_step(self, model: str) -> Optional[float]:
+    @time_func("WorkerDispatch.optim_step")
+    async def optim_step(self, model: str) -> Optional[float]:
         """Run optimizer step. Model should already be on GPU from forward_backward."""
         refs = self._actor_groups[model].async_run_ray_method("pass_through", "optim_step")
-        grad_norms = ray.get(refs)
+        grad_norms = await asyncio.gather(*refs)
 
-        self._save_memory_snapshot(model, "optim_step")
+        await self._save_memory_snapshot(model, "optim_step")
         return grad_norms[0]
 
-    def set_lr(self, model: str, learning_rate: float) -> None:
+    async def set_lr(self, model: str, learning_rate: float) -> None:
         """Set learning rate for model's optimizer.
 
         This directly updates the optimizer's param_groups on all workers,
         bypassing the scheduler. Useful for external learning rate schedules.
         """
-        self._ensure_on_gpu(model, need_optimizer=True, need_model=False)
-        ray.get(self._actor_groups[model].async_run_ray_method("pass_through", "set_lr", learning_rate=learning_rate))
+        await self._ensure_on_gpu(model, need_optimizer=True, need_model=False)
+        refs = self._actor_groups[model].async_run_ray_method("pass_through", "set_lr", learning_rate=learning_rate)
+        if isinstance(refs, list):
+             await asyncio.gather(*refs)
+        else:
+             await refs
 
-    def _save_memory_snapshot(self, model: str, tag: str) -> None:
+    @time_func("WorkerDispatch._save_memory_snapshot")
+    async def _save_memory_snapshot(self, model: str, tag: str) -> None:
         """Save memory snapshot on workers."""
-        ray.get(
-            self._actor_groups[model].async_run_ray_method("pass_through", "save_memory_snapshot", tag=f"{model}_{tag}")
-        )
+        refs = self._actor_groups[model].async_run_ray_method("pass_through", "save_memory_snapshot", tag=f"{model}_{tag}")
+        if isinstance(refs, list):
+            await asyncio.gather(*refs)
+        else:
+            await refs
 
-    def save_checkpoint(self, model: str, ckpt_dir: str, tokenizer=None) -> None:
+    async def save_checkpoint(self, model: str, ckpt_dir: str, tokenizer=None) -> None:
         """Save checkpoint for model."""
-        self._ensure_on_gpu(model, need_optimizer=True, need_model=True)
+        await self._ensure_on_gpu(model, need_optimizer=True, need_model=True)
 
-        ray.get(
-            self._actor_groups[model].async_run_ray_method(
-                "pass_through", "save_checkpoint", ckpt_dir=ckpt_dir, tokenizer=tokenizer
-            )
+        refs = self._actor_groups[model].async_run_ray_method(
+            "pass_through", "save_checkpoint", ckpt_dir=ckpt_dir, tokenizer=tokenizer
         )
+        if isinstance(refs, list):
+            await asyncio.gather(*refs)
+        else:
+            await refs
 
-    def load_checkpoint(
+    async def load_checkpoint(
         self,
         model: str,
         ckpt_dir: str,
@@ -313,78 +345,100 @@ class WorkerDispatch:
         load_lr_scheduler_states: bool = True,
     ) -> None:
         """Load checkpoint for model."""
-        self._ensure_on_gpu(model, need_optimizer=load_optimizer_states, need_model=True)
+        await self._ensure_on_gpu(model, need_optimizer=load_optimizer_states, need_model=True)
 
-        ray.get(
-            self._actor_groups[model].async_run_ray_method(
-                "pass_through",
-                "load_checkpoint",
-                ckpt_dir=ckpt_dir,
-                load_optimizer_states=load_optimizer_states,
-                load_lr_scheduler_states=load_lr_scheduler_states,
-            )
+        refs = self._actor_groups[model].async_run_ray_method(
+            "pass_through",
+            "load_checkpoint",
+            ckpt_dir=ckpt_dir,
+            load_optimizer_states=load_optimizer_states,
+            load_lr_scheduler_states=load_lr_scheduler_states,
         )
+        if isinstance(refs, list):
+            await asyncio.gather(*refs)
+        else:
+            await refs
 
-    def save_hf_model(self, model: str, export_dir: str, tokenizer) -> None:
+    async def save_hf_model(self, model: str, export_dir: str, tokenizer) -> None:
         """Save model in HuggingFace format."""
-        self._ensure_on_gpu(model, need_optimizer=False, need_model=True)
+        await self._ensure_on_gpu(model, need_optimizer=False, need_model=True)
 
-        ray.get(self._actor_groups[model].async_run_ray_method("pass_through", "save_hf_model", export_dir, tokenizer))
+        refs = self._actor_groups[model].async_run_ray_method("pass_through", "save_hf_model", export_dir, tokenizer)
+        if isinstance(refs, list):
+            await asyncio.gather(*refs)
+        else:
+            await refs
 
-    def init_model(self, model: str, model_path: str, num_training_steps: Optional[int] = None) -> None:
+    @time_func("WorkerDispatch.init_model")
+    async def init_model(self, model: str, model_path: str, num_training_steps: Optional[int] = None) -> None:
         """Initialize model from path. Offloads others in colocation group first."""
         # Offload others in colocation group before init
         if self._should_manage_offload(model):
             group = self._get_colocation_group(model)
+            tasks = []
             for other in group:
                 if other != model and other in self._actor_groups:
                     state = self._gpu_state[other]
                     if state.model_on_gpu or state.optimizer_on_gpu:
-                        self._actor_groups[other].offload_to_cpu()
+                        tasks.extend(self._actor_groups[other].offload_to_cpu(nonblocking=True))
                         self._gpu_state[other] = GPUState()
+            if tasks:
+                await asyncio.gather(*tasks)
 
         kwargs = {"model_path": model_path}
         if num_training_steps is not None:
             kwargs["num_training_steps"] = num_training_steps
 
-        ray.get(self._actor_groups[model].async_init_model(**kwargs))
+        refs = self._actor_groups[model].async_init_model(**kwargs)
+        if isinstance(refs, list):
+            await asyncio.gather(*refs)
+        else:
+            await refs
 
         # After init, model is on GPU
         self._gpu_state[model].model_on_gpu = True
         self._gpu_state[model].optimizer_on_gpu = model != "ref"  # ref has no optimizer
 
-    def init_weight_sync_state(self, inference_engine_client) -> None:
+    @time_func("WorkerDispatch.init_weight_sync_state")
+    async def init_weight_sync_state(self, inference_engine_client) -> None:
         """Initialize weight sync state for policy model."""
-        ray.get(
-            self._actor_groups["policy"].async_run_ray_method(
+        refs = self._actor_groups["policy"].async_run_ray_method(
                 "pass_through",
                 "init_weight_sync_state",
                 inference_engine_client,
                 self.cfg.generator.inference_engine,
-            )
         )
+        if isinstance(refs, list):
+            await asyncio.gather(*refs)
+        else:
+            await refs
 
-    def broadcast_to_inference_engines(self, inference_engine_client) -> None:
+    @time_func("WorkerDispatch.broadcast_to_inference_engines")
+    async def broadcast_to_inference_engines(self, inference_engine_client) -> None:
         """Broadcast policy weights to inference engines."""
-        ray.get(
-            self._actor_groups["policy"].async_run_ray_method(
+        refs = self._actor_groups["policy"].async_run_ray_method(
                 "pass_through",
                 "broadcast_to_inference_engines",
                 inference_engine_client,
                 self.cfg.generator.inference_engine,
             )
-        )
+        if isinstance(refs, list):
+            await asyncio.gather(*refs)
+        else:
+            await refs
 
-    def prepare_for_weight_sync(self) -> None:
+    @time_func("WorkerDispatch.prepare_for_weight_sync")
+    async def prepare_for_weight_sync(self) -> None:
         """Prepare for weight sync: ensure policy model is on GPU, offload optimizer."""
         if not self.colocate_all:
             return
         # Ensure policy model is on GPU (will offload others in colocation group)
-        self._ensure_on_gpu("policy", need_optimizer=False, need_model=True)
+        await self._ensure_on_gpu("policy", need_optimizer=False, need_model=True)
         # Offload optimizer if it's on GPU
         if self._gpu_state["policy"].optimizer_on_gpu:
-            self._offload("policy", offload_optimizer=True, offload_model=False)
+            await self._offload("policy", offload_optimizer=True, offload_model=False)
 
+    @time_func("WorkerDispatch.finish_weight_sync")
     def finish_weight_sync(self) -> None:
         """Finish weight sync: offload model weights and optimizer state."""
         if not self.colocate_all:
@@ -404,7 +458,7 @@ class WorkerDispatch:
             )
 
         # Sync weights to inference engine
-        self.prepare_for_weight_sync()
+        await self.prepare_for_weight_sync()
         if self.colocate_all:
             await self._inference_engine_client.wake_up(tags=["weights"])
             self.broadcast_to_inference_engines(self._inference_engine_client)
@@ -427,20 +481,33 @@ class WorkerDispatch:
         """
         self._inference_engine_client = inference_engine_client
 
-    def empty_cache(self, model: Optional[str] = None) -> None:
+    async def empty_cache(self, model: Optional[str] = None) -> None:
         """Empty GPU cache for model(s)."""
         if model is not None:
-            ray.get(self._actor_groups[model].async_run_ray_method("pass_through", "empty_cache"))
+            refs = self._actor_groups[model].async_run_ray_method("pass_through", "empty_cache")
+            if isinstance(refs, list):
+                await asyncio.gather(*refs)
+            else:
+                await refs
         else:
             refs = []
             for group in self._actor_groups.values():
-                refs.extend(group.async_run_ray_method("pass_through", "empty_cache"))
-            ray.get(refs)
+                r = group.async_run_ray_method("pass_through", "empty_cache")
+                if isinstance(r, list):
+                    refs.extend(r)
+                else:
+                    refs.append(r)
+            if refs:
+                await asyncio.gather(*refs)
 
-    def get_node_ids(self) -> List[str]:
+    async def get_node_ids(self) -> List[str]:
         """Get unique node IDs from all actor groups."""
         all_node_ids = []
         for group in self._actor_groups.values():
-            node_ids = ray.get(group.async_run_ray_method("pass_through", "get_ray_node_id"))
+            refs = group.async_run_ray_method("pass_through", "get_ray_node_id")
+            if isinstance(refs, list):
+                node_ids = await asyncio.gather(*refs)
+            else:
+                node_ids = await refs
             all_node_ids.extend(node_ids)
         return list(set(all_node_ids))

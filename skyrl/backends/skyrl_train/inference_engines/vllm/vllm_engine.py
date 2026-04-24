@@ -58,8 +58,10 @@ class Logprob:
     rank: int
     token_id: str
 
+import torch
 
 def setup_envvars_for_vllm(kwargs, bundle_indices):
+    logger.info(f"{torch.cuda.is_available()=}, {torch.cuda.device_count()=}")
     noset_visible_devices = kwargs.pop("noset_visible_devices")
     mp_cuda_visible_devices = kwargs.pop("mp_cuda_visible_devices", None)
 
@@ -77,17 +79,26 @@ def setup_envvars_for_vllm(kwargs, bundle_indices):
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         os.environ.pop("ROCR_VISIBLE_DEVICES", None)
         os.environ.pop("HIP_VISIBLE_DEVICES", None)
+        logger.info("Removed *_VISIBLE_DEVICES from environment to let vLLM/Ray handle GPU visibility for distributed execution.")
     elif noset_visible_devices:
         # We need to set CUDA_VISIBLE_DEVICES to the ray assigned GPU
         # when the distributed_executor_backend is not ray/mp and
         # RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES is set.
         os.environ["CUDA_VISIBLE_DEVICES"] = str(ray.get_gpu_ids()[0])
+        logger.info(f"Set CUDA_VISIBLE_DEVICES to {os.environ['CUDA_VISIBLE_DEVICES']} for non-Ray distributed execution with noset_visible_devices=True.")
+    logger.info(f"{torch.cuda.is_available()=}, {torch.cuda.device_count()=}")
 
     num_gpus = kwargs.pop("num_gpus")
+    logger.info(f"Number of GPUs configured for vLLM: {num_gpus}")
     if bundle_indices is not None:
         os.environ["VLLM_RAY_PER_WORKER_GPUS"] = str(num_gpus)
         os.environ["VLLM_RAY_BUNDLE_INDICES"] = ",".join(map(str, bundle_indices))
         logger.info(f"creating LLM with bundle_indices={bundle_indices}")
+    logger.info(f"{torch.cuda.is_available()=}, {torch.cuda.device_count()=}")
+    
+    total_rank = kwargs.pop("total_rank", None)
+    if total_rank is not None:
+        os.environ["SKYRL_ENGINE_IDX"] = str(total_rank)
 
 
 class BaseVLLMInferenceEngine(InferenceEngineInterface):
@@ -248,6 +259,7 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
 
     async def generate(self, input_batch: InferenceEngineInput) -> InferenceEngineOutput:
         prompt_token_ids, sampling_params = self._preprocess_prompts(input_batch)
+        session_ids = input_batch.get("session_ids", None)
 
         # Check if LoRA is enabled and create LoRA requests
         lora_requests = None
@@ -266,6 +278,7 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
             prompts=[TokensPrompt(prompt_token_ids=r) for r in prompt_token_ids],
             sampling_params=sampling_params,
             lora_request=lora_requests,
+            session_ids=session_ids,
         )
 
         return self._postprocess_outputs(outputs)
@@ -361,7 +374,10 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         if enable_ray_prometheus_stats:
             stat_loggers = self._create_ray_prometheus_stat_loggers()
 
+        logger.info(f"{torch.cuda.is_available()=}, {torch.cuda.device_count()=}")
+        logger.info(f"Creating vLLM AsyncLLMEngine with engine_args: {engine_args} and stat_loggers: {stat_loggers}")
         engine = vllm.AsyncLLMEngine.from_engine_args(engine_args, stat_loggers=stat_loggers)
+        logger.info(f"vLLM AsyncLLMEngine created successfully!!!")
 
         model_path = kwargs.get("model")
         # Use served_model_name if provided (from generator.served_model_name config),
@@ -488,12 +504,18 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
     async def generate(self, input_batch: InferenceEngineInput) -> InferenceEngineOutput:
         """Generate responses using vLLM's async engine."""
         prompt_token_ids, sampling_params = self._preprocess_prompts(input_batch)
+        session_ids = input_batch.get("session_ids", None)
 
         tasks = []
-        for prompt in prompt_token_ids:
+        for i, prompt in enumerate(prompt_token_ids):
             # Schedule the collection of outputs for each prompt.
             # Avoid duplicate request_ids
             request_id = str(uuid4().hex)
+            if session_ids:
+                # This handles parallel requests in a single session,
+                # even though it's not really possible at the moment
+                request_id = f"{session_ids[i]}_{request_id}"
+            logger.info(f"Generation for prompt {i} with request_id {request_id} (session_id: {session_ids[i] if session_ids else 'N/A'})")
             task = asyncio.create_task(self._collect_outputs(prompt, request_id, sampling_params))
             tasks.append(task)
         outputs = await asyncio.gather(*tasks)

@@ -19,6 +19,7 @@ import functools
 from collections import OrderedDict
 from contextlib import nullcontext
 from typing import Union
+from loguru import logger
 
 import torch
 import torch.distributed as dist
@@ -36,6 +37,7 @@ from torch.distributed.fsdp.wrap import (
     transformer_auto_wrap_policy,
 )
 from transformers.trainer_pt_utils import get_module_class_from_name
+from skyrl.train.utils import (time_func, Timer)
 
 from skyrl.train.config import FSDPConfig
 
@@ -220,7 +222,7 @@ def load_fsdp2_model_to_gpu(model):
 
 @torch.no_grad()
 def offload_fsdp_optimizer(optimizer):
-    if not optimizer.state:
+    if not hasattr(optimizer, "state") or not optimizer.state:
         return
     for param_group in optimizer.param_groups:
         for param in param_group["params"]:
@@ -232,7 +234,7 @@ def offload_fsdp_optimizer(optimizer):
 
 @torch.no_grad()
 def load_fsdp_optimizer(optimizer, device_id):
-    if not optimizer.state:
+    if not hasattr(optimizer, "state") or not optimizer.state:
         return
     for param_group in optimizer.param_groups:
         for param in param_group["params"]:
@@ -282,6 +284,7 @@ def _sync_non_persistent_buffers(model: torch.nn.Module, loaded_sd: dict):
 # Fsdp2 load full state dict from `accelerate`
 # Reference: https://github.com/huggingface/accelerate/blob/0af621bbecc0e43f5d43766a4945d3d2236bb8a9/src/accelerate/utils/fsdp_utils.py#L455
 # NOTE (sumanthrh): The original code from `accelerate` assumes init on meta device - with cpu init only on rank 0, but the code is compatible with cpu init on all ranks.
+@time_func("fsdp2_load_full_state_dict")
 def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offload=None):
     """
     Loads the full state dict (could be only on rank 0) into the sharded model. This is done by broadcasting the
@@ -409,10 +412,20 @@ def fsdp2_get_full_state_dict(model: torch.nn.Module, cpu_offload=True, rank0_on
 
     return state_dict
 
-
+@time_func("apply_fsdp2")
 def apply_fsdp2(model, fsdp_kwargs, config: Union[FSDPConfig, DictConfig]):
     """model: AutoModelForCausalLM"""
     assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
+    
+    # # Check if num_model_units is specified
+    # num_model_units = config.get("wrap_policy", {}).get("num_model_units", None)
+    
+    # if num_model_units is not None and num_model_units == 1:
+    #     # Wrap entire model as a single FSDP unit without wrapping submodules
+    #     logger.info("Wrapping entire model as single unit.")
+    #     fully_shard(model, **fsdp_kwargs)
+    #     return
+
     default_transformer_cls_names_to_wrap = getattr(model, "_no_split_modules", None)
     fsdp_transformer_layer_cls_to_wrap = (
         config.wrap_policy.get("transformer_layer_cls_to_wrap", None)
@@ -434,8 +447,22 @@ def apply_fsdp2(model, fsdp_kwargs, config: Union[FSDPConfig, DictConfig]):
         ):
             modules.append(module)
 
-    for idx, module in enumerate(modules):
-        fully_shard(module, **fsdp_kwargs)
+    # if num_model_units is not None and num_model_units > 1:
+    #     pass
+    #     # import math
+    #     # total_params = sum(p.numel() for p in model.parameters())
+    #     # target_params = math.ceil(total_params / num_model_units)
+    #     # logger.info(f"Using num_model_units={num_model_units}, target_params per unit={target_params}")
+    #     # min_params = int(target_params * 0.9)  # Example threshold, adjust as needed
+    #     # max_params = int(target_params * 1.1)  # Example threshold, adjust as needed
+            
+    #     # logger.info(f"Targeting shards between {min_params:,} and {max_params:,} parameters")
+    # else:
+    #     # Default: wrap each layer individually
+    #     logger.info(f"Wrapping {len(modules)} modules individually. Names: {[module.__class__.__name__ for module in modules]}")
+    #     for idx, module in enumerate(modules):
+    #         fully_shard(module, **fsdp_kwargs)
+            
     fully_shard(model, **fsdp_kwargs)  # fsdp2 will not reshard_after_forward for root module
 
 

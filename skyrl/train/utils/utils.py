@@ -12,12 +12,15 @@ from pathlib import Path
 import ray
 import torch
 from loguru import logger
+from functools import wraps
+from omegaconf import DictConfig, OmegaConf
 from ray.util.placement_group import (
     PlacementGroup,
     PlacementGroupSchedulingStrategy,
     placement_group,
     placement_group_table,
 )
+from functools import wraps
 
 from skyrl.env_vars import (
     _SKYRL_USE_NEW_INFERENCE,
@@ -28,31 +31,58 @@ from skyrl.env_vars import (
 )
 from skyrl.train.config.config import SkyRLTrainConfig
 
-
 class Timer:
     def __init__(self, message, update_dict=None):
         self.message = message
         self.update_dict = update_dict
+        self.logger = logger
 
     def __enter__(self):
         self.start_time = time.time()
-        logger.opt(depth=1).info(f"Started: '{self.message}'")
+        # if self.logger is None:
+        #     from loguru import logger
+        #     configure_ray_worker_logging(logger)
+        #     self.logger = logger
+        self.logger.opt(depth=1).info(f"Started: '{self.message}'")
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        logger.opt(depth=1).info(f"Finished: '{self.message}', time cost: {time.time() - self.start_time:.2f}s")
+        self.logger.opt(depth=1).info(f"Finished: '{self.message}', time cost: {time.time() - self.start_time:.2f}s")
         if self.update_dict is not None:
             self.update_dict[self.message] = self.update_dict.get(self.message, 0.0) + time.time() - self.start_time
 
     async def __aenter__(self):
         self.start_time = time.time()
-        logger.opt(depth=1).info(f"Started: '{self.message}'")
+        # if self.logger is None:
+        #     from loguru import logger
+        #     configure_ray_worker_logging(logger)
+        #     self.logger = logger
+        self.logger.opt(depth=1).info(f"Started: '{self.message}'")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        logger.opt(depth=1).info(f"Finished: '{self.message}', time cost: {time.time() - self.start_time:.2f}s")
+        self.logger.opt(depth=1).info(f"Finished: '{self.message}', time cost: {time.time() - self.start_time:.2f}s")
         if self.update_dict is not None:
             self.update_dict[self.message] = self.update_dict.get(self.message, 0.0) + time.time() - self.start_time
+
+
+import inspect
+
+def time_func(msg: str):
+    def decorator(func): # 2. Level to capture the function
+        if inspect.iscoroutinefunction(func):
+            @wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                with Timer(msg):
+                    return await func(*args, **kwargs)
+            return async_wrapper
+        else:
+            @wraps(func)
+            def wrapper(*args, **kwargs):
+                with Timer(msg):
+                    return func(*args, **kwargs)
+            return wrapper
+    return decorator
 
 
 def validate_batch_sizes(cfg: SkyRLTrainConfig):
@@ -785,7 +815,8 @@ def initialize_ray(cfg: SkyRLTrainConfig):
 
     # log_to_driver=True allows training progress from skyrl_entrypoint to reach stdout.
     # Infrastructure logs (vLLM, workers) are redirected to log file via os.dup2 in their init.
-    ray.init(runtime_env={"env_vars": env_vars}, log_to_driver=True)
+    ray.init(runtime_env={"env_vars": env_vars, 'excludes': ['**/output/**/*', '**/arbor-output/**/*', '**/.venv/**/*']}, log_to_driver=True, _temp_dir="/local_nvme1/mborjigi/tmp/ray")
+    # ray.init(runtime_env={"env_vars": env_vars, 'excludes': ['**/output/**/*', '**/arbor-output/**/*', '**/.venv/**/*', '**/.git/**/*']}, log_to_driver=True, _temp_dir="/local_nvme1/mborjigi/tmp/ray")
 
     if not verbose_logging:
         logger.info(f"Infrastructure logs will be written to: {log_file}")
@@ -959,7 +990,7 @@ def peer_access_supported(max_num_gpus_per_node: int):
 
     if not torch.cuda.is_available():
         # we are on cpu head node, so we need to check P2P access on a node with 2 GPUs
-        ray.init()
+        ray.init(runtime_env={'excludes': ['**/output/**/*', '**/arbor-output/**/*', '**/.venv/**/*', '**/.git/**/*']})
         pg = placement_group([{"CPU": 1, "GPU": 2}], strategy="PACK")
         get_ray_pg_ready_with_timeout(pg, timeout=SKYRL_RAY_PG_TIMEOUT_IN_S)
         result = ray.get(

@@ -30,6 +30,8 @@ from skyrl.backends.skyrl_train.training_batch import (
     TensorList,
     TrainingInputBatch,
     pad_training_input_batch,
+    strings_to_tensor,
+    tensor_to_strings,
 )
 from skyrl.backends.skyrl_train.utils import ppo_utils
 from skyrl.backends.skyrl_train.utils.io import io
@@ -56,6 +58,7 @@ from skyrl.train.generators.base import (
     GeneratorInput,
     GeneratorInterface,
     GeneratorOutput,
+    TrajectoryID,
 )
 from skyrl.train.generators.utils import (
     get_metrics_from_generator_output,
@@ -185,12 +188,12 @@ class RayPPOTrainer:
         """
         # Initialize weight sync state between policy model and inference engines.
         with Timer("init_weight_sync_state"):
-            self.init_weight_sync_state()
+            await self.init_weight_sync_state()
 
         # Load checkpoint state if resumption is enabled.
         if self.resume_mode != ResumeMode.NONE:
             with Timer("load_checkpoints"):
-                self.global_step, _ = self.load_checkpoints()
+                self.global_step, _ = await self.load_checkpoints()
 
         # Prepare weights for sampling
         with Timer("sync_weights"):
@@ -268,7 +271,7 @@ class RayPPOTrainer:
 
                     # 4. Inference and calculate values, log probs, rewards, kl divergence
                     with Timer("fwd_logprobs_values_reward", self.all_timings):
-                        training_input = self.fwd_logprobs_values_reward(training_input)
+                        training_input = await self.fwd_logprobs_values_reward(training_input)
 
                     # 5. apply kl divergence penalty to rewards
                     if self.cfg.trainer.algorithm.use_kl_in_reward:
@@ -292,18 +295,18 @@ class RayPPOTrainer:
                     # 7. train policy/critic model
                     # Policy model is backloaded to GPU during training
                     with Timer("train_critic_and_policy", self.all_timings):
-                        status = self.train_critic_and_policy(training_input)
+                        status = await self.train_critic_and_policy(training_input)
 
                     # 8. conditionally save checkpoints and hf model
                     is_epoch_end = self.global_step % len(self.train_dataloader) == 0
                     if self.cfg.trainer.ckpt_interval > 0:
                         if is_epoch_end or self.global_step % self.cfg.trainer.ckpt_interval == 0:
                             with Timer("save_checkpoints", self.all_timings):
-                                self.save_checkpoints()
+                                await self.save_checkpoints()
                     if self.cfg.trainer.hf_save_interval > 0:
                         if is_epoch_end or self.global_step % self.cfg.trainer.hf_save_interval == 0:
                             with Timer("save_hf_model", self.all_timings):
-                                self.save_models()
+                                await self.save_models()
 
                     # 9. conditionally sync policy and ref at the end of the epoch
                     if (
@@ -313,7 +316,7 @@ class RayPPOTrainer:
                         and epoch != self.cfg.trainer.epochs - 1  # skip updating ref at the end of the last epoch
                     ):
                         with Timer("update_ref_with_policy", self.all_timings):
-                            self.update_ref_with_policy()
+                            await self.update_ref_with_policy()
 
                     # 10. Prepare weights for sampling
                     with Timer("sync_weights", self.all_timings):
@@ -344,6 +347,7 @@ class RayPPOTrainer:
 
                 self.global_step += 1
 
+                # del generator_output
                 del training_input, generator_output
 
         pbar.close()
@@ -353,11 +357,11 @@ class RayPPOTrainer:
         # Safety net: always save final checkpoint at end of training.
         if self.cfg.trainer.ckpt_interval > 0:
             with Timer("save_checkpoints", self.all_timings):
-                self.save_checkpoints()
+                await self.save_checkpoints()
                 logger.info("Saved final checkpoint.")
         if self.cfg.trainer.hf_save_interval > 0:
             with Timer("save_hf_model", self.all_timings):
-                self.save_models()
+                await self.save_models()
                 logger.info("Saved final model.")
         self.tracker.finish()
         logger.info("Training done!")
@@ -584,11 +588,11 @@ class RayPPOTrainer:
 
         logger.info("init policy/ref/critic models done")
 
-    def init_weight_sync_state(self):
+    async def init_weight_sync_state(self):
         """
         Setup the connection between policy model and inference engine for weight syncing.
         """
-        self.dispatch.init_weight_sync_state(self.inference_engine_client)
+        await self.dispatch.init_weight_sync_state(self.inference_engine_client)
         logger.info("Initialized weight sync state for policy model and inference engines.")
 
     def sync_policy_weights_to_inference_engines(self) -> List[ObjectRef]:
@@ -627,6 +631,9 @@ class RayPPOTrainer:
         rollout_expert_indices: Optional[List[List[List[List[int]]]]] = generator_output.get(
             "rollout_expert_indices", None
         )
+        
+        trajectory_ids: Optional[List[TrajectoryID]] = generator_output.get("trajectory_ids", None)
+        trajectory_ids = [tid.to_string() for tid in trajectory_ids] if trajectory_ids is not None else None
 
         pixel_values = generator_output.get("pixel_values", None)
         image_grid_thw = generator_output.get("image_grid_thw", None)
@@ -682,6 +689,7 @@ class RayPPOTrainer:
                 "rollout_expert_indices": rollout_expert_indices_tensor,
                 "pixel_values": pixel_values,
                 "image_grid_thw": image_grid_thw,
+                "trajectory_ids": strings_to_tensor(trajectory_ids) if trajectory_ids is not None else None,
             },
         )
         training_input.metadata = {"uids": uids}
@@ -738,6 +746,7 @@ class RayPPOTrainer:
         - after calling this method, the same model placement still holds.
         """
         # NOTE: we assume that .generate returns samples in the same order as passed in
+        logger.info(f"Calling generator with batch of size {len(input_batch['prompts'])} with trajectory ids {input_batch.get('trajectory_ids', None)}")
         generator_output: GeneratorOutput = await self.generator.generate(input_batch)
 
         # add rollout metrics to self.all_metrics
@@ -965,7 +974,7 @@ class RayPPOTrainer:
         data.save(data_save_dir / f"{file_name}.pkl")
 
     @torch.no_grad()
-    def fwd_logprobs_values_reward(
+    async def fwd_logprobs_values_reward(
         self,
         training_input: TrainingInputBatch,
     ):
@@ -991,7 +1000,7 @@ class RayPPOTrainer:
             fwd_keys.append("pixel_values")
         if training_input.get("image_grid_thw") is not None:
             fwd_keys.append("image_grid_thw")
-        data_fwd_pass = training_input.select(keys=fwd_keys, metadata_keys=["response_length"])
+        data_fwd_pass = training_input.select(keys=fwd_keys, metadata_keys=["response_length", "trajectory_ids"])
 
         values = None
         base_log_probs = None
@@ -999,21 +1008,22 @@ class RayPPOTrainer:
 
         # Critic forward (dispatch handles offload/backload automatically)
         if self.has_critic:
-            critic_output = self.dispatch.forward("critic", data_fwd_pass)
+            critic_output = await self.dispatch.forward("critic", data_fwd_pass)
             values = critic_output["output"]
 
         # Ref forward
         if self.ref_model is not None:
-            ref_output = self.dispatch.forward("ref", data_fwd_pass)
+            ref_output = await self.dispatch.forward("ref", data_fwd_pass)
             base_log_probs = ref_output["output"]
-            self.dispatch.empty_cache("ref")
+            await self.dispatch.empty_cache("ref")
 
         # Policy forward
-        policy_output = self.dispatch.forward("policy", data_fwd_pass)
+        with Timer("fwd_logprobs_values_reward__policy", self.all_timings):
+            policy_output = await self.dispatch.forward("policy", data_fwd_pass)
         action_log_probs = policy_output["output"]
 
         # Empty cache after all forward passes
-        self.dispatch.empty_cache()
+        await self.dispatch.empty_cache()
 
         sequences_all: torch.Tensor = training_input["sequences"]
         # NOTE (sumanthrh): The slicing is needed to make sure that the batch dimension doesn't change for the tensordict.
@@ -1132,7 +1142,7 @@ class RayPPOTrainer:
         data["advantages"] = normalized_advantages
         return data
 
-    def _execute_training_step(self, model: str, data: TrainingInputBatch) -> Dict[str, float]:
+    async def _execute_training_step(self, model: str, data: TrainingInputBatch) -> Dict[str, float]:
         """
         Execute training step using forward_backward + optim_step.
 
@@ -1164,12 +1174,12 @@ class RayPPOTrainer:
         # Training loop over epochs and mini-batches
         for _epoch in range(self.cfg.trainer.update_epochs_per_batch):
             for chunk_refs in all_chunk_refs:
-                status = self.dispatch.forward_backward_from_staged(model, chunk_refs)
+                status = await self.dispatch.forward_backward_from_staged(model, chunk_refs)
                 for k, v in status.items():
                     all_metrics[k].append(v)
 
                 # Optimizer step after each mini batch
-                grad_norm = self.dispatch.optim_step(model)
+                grad_norm = await self.dispatch.optim_step(model)
                 if grad_norm is not None:
                     all_metrics["grad_norm"].append(grad_norm)
 
@@ -1179,7 +1189,7 @@ class RayPPOTrainer:
         reduced_metrics = reduce_metrics(all_metrics, sum_loss_metrics=False)
         return reduced_metrics
 
-    def train_critic_and_policy(self, data: TrainingInputBatch):
+    async def train_critic_and_policy(self, data: TrainingInputBatch):
         """
         Run the training step for the policy and critic models.
 
@@ -1191,9 +1201,9 @@ class RayPPOTrainer:
         # Unified training interface for both FSDP and Megatron
         if self.has_critic:
             with Timer("critic_train", self.all_timings):
-                critic_status = self._execute_training_step("critic", data)
+                critic_status = await self._execute_training_step("critic", data)
         with Timer("policy_train", self.all_timings):
-            policy_status = self._execute_training_step("policy", data)
+            policy_status = await self._execute_training_step("policy", data)
 
         # Update metrics
         if critic_status is not None:
@@ -1203,7 +1213,7 @@ class RayPPOTrainer:
         for k, v in policy_status.items():
             self.all_metrics.update({f"policy/{k}": v})
 
-        self.dispatch.empty_cache()
+        await self.dispatch.empty_cache()
 
         return policy_status
 
@@ -1278,7 +1288,7 @@ class RayPPOTrainer:
         actor_info: ActorInfo = model.actor_infos[rank]
         return actor_info.rank
 
-    def save_checkpoints(self):
+    async def save_checkpoints(self):
         """
         Save the model, optimizer, and training states to disk.
 
@@ -1292,11 +1302,11 @@ class RayPPOTrainer:
         io.makedirs(global_step_folder, exist_ok=True)
 
         # Save policy checkpoint (dispatch handles offload/backload)
-        self.dispatch.save_checkpoint("policy", policy_save_dir, self.tokenizer)
+        await self.dispatch.save_checkpoint("policy", policy_save_dir, self.tokenizer)
 
         # Save critic checkpoint (if it exists)
         if self.has_critic:
-            self.dispatch.save_checkpoint("critic", critic_save_dir, self.tokenizer)
+            await self.dispatch.save_checkpoint("critic", critic_save_dir, self.tokenizer)
 
         # Save dataloader state
         dataloader_save_path = os.path.join(global_step_folder, "data.pt")
@@ -1327,11 +1337,11 @@ class RayPPOTrainer:
 
         # Clean up old checkpoints after successful save
         with Timer("cleanup_old_checkpoints", self.all_timings):
-            self._cleanup_old_checkpoints()
+            await self._cleanup_old_checkpoints()
 
-    def _cleanup_old_checkpoints(self):
+    async def _cleanup_old_checkpoints(self):
         if not self._node_ids:
-            self._node_ids = self.dispatch.get_node_ids()
+            self._node_ids = await self.dispatch.get_node_ids()
         run_on_each_node(
             self._node_ids,
             cleanup_old_checkpoints,
@@ -1342,7 +1352,7 @@ class RayPPOTrainer:
         # NOTE (sumanthrh): the function will get called twice on the node with driver process, but it's ok because it's idempotent
         cleanup_old_checkpoints(self.cfg.trainer.ckpt_path, self.cfg.trainer.max_ckpts_to_keep)
 
-    def load_checkpoints(self) -> Tuple[int, str]:
+    async def load_checkpoints(self) -> Tuple[int, str]:
         """
         Load complete checkpoint state and return the global_step to resume from.
         Returns 0 if no checkpoint is loaded.
@@ -1433,7 +1443,7 @@ class RayPPOTrainer:
 
         # 3. Load policy checkpoint (dispatch handles offload/backload)
         logger.info(f"Loading policy checkpoint from {policy_ckpt_dir}")
-        self.dispatch.load_checkpoint(
+        await self.dispatch.load_checkpoint(
             "policy",
             policy_ckpt_dir,
             load_optimizer_states=True,
@@ -1444,7 +1454,7 @@ class RayPPOTrainer:
         # 4. Load critic checkpoint if it exists and we have a critic model
         if self.has_critic:
             logger.info(f"Loading critic checkpoint from {critic_ckpt_dir}")
-            self.dispatch.load_checkpoint(
+            await self.dispatch.load_checkpoint(
                 "critic",
                 critic_ckpt_dir,
                 load_optimizer_states=True,
@@ -1455,22 +1465,22 @@ class RayPPOTrainer:
         logger.info(f"Successfully loaded complete checkpoint state from global_step_{global_step}")
         return global_step, str(checkpoint_path)
 
-    def save_models(self):
+    async def save_models(self):
         """
         Save the model parameters in HF format at `cfg.trainer.export_path`.
 
         Dispatch handles offload/backload automatically for all colocation configurations.
         """
         policy_export_dir = os.path.join(self.cfg.trainer.export_path, f"global_step_{self.global_step}", "policy")
-        self.dispatch.save_hf_model("policy", policy_export_dir, self.tokenizer)
+        await self.dispatch.save_hf_model("policy", policy_export_dir, self.tokenizer)
 
         if self.has_critic:
             critic_export_dir = os.path.join(self.cfg.trainer.export_path, f"global_step_{self.global_step}", "critic")
-            self.dispatch.save_hf_model("critic", critic_export_dir, self.tokenizer)
+            await self.dispatch.save_hf_model("critic", critic_export_dir, self.tokenizer)
 
         logger.info("Successfully saved model weights.")
 
-    def update_ref_with_policy(self):
+    async def update_ref_with_policy(self):
         """
         Update the reference model with the policy model weights (required by some algorithms).
 
@@ -1481,10 +1491,10 @@ class RayPPOTrainer:
         policy_export_dir = os.path.join(self.cfg.trainer.export_path, f"global_step_{self.global_step}", "policy")
 
         # Save policy model (dispatch handles GPU state)
-        self.dispatch.save_hf_model("policy", policy_export_dir, self.tokenizer)
+        await self.dispatch.save_hf_model("policy", policy_export_dir, self.tokenizer)
 
         # Re-initialize ref model from saved policy (dispatch handles offloading policy first)
-        self.dispatch.init_model("ref", policy_export_dir)
+        await self.dispatch.init_model("ref", policy_export_dir)
 
         # Clean up temporary saved model files
         try:

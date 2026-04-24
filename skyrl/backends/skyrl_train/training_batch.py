@@ -454,6 +454,39 @@ class TensorBatch(dict, Generic[DictType]):
         return self.__str__()
 
 
+def strings_to_tensor(strings: List[str]) -> torch.Tensor:
+    """Encode a list of strings as a uint8 tensor using UTF-32.
+
+    Each string is stored as a fixed-width row of bytes (4 bytes per character,
+    zero-padded to the length of the longest string in the batch).
+
+    Args:
+        strings: The list of strings to encode.
+
+    Returns:
+        A uint8 tensor of shape ``(len(strings), max_chars * 4)``.
+    """
+    if not strings:
+        return torch.zeros((0, 0), dtype=torch.uint8)
+    arr = np.array(strings)  # numpy encodes as UTF-32 (4 bytes/char), zero-pads to max length
+    return torch.from_numpy(arr.view(np.uint8).copy().reshape(len(arr), -1))
+
+
+def tensor_to_strings(tensor: torch.Tensor) -> List[str]:
+    """Decode a uint8 tensor produced by :func:`strings_to_tensor` back to strings.
+
+    Args:
+        tensor: A uint8 tensor of shape ``(N, max_chars * 4)``.
+
+    Returns:
+        A list of ``N`` decoded strings.
+    """
+    if tensor.numel() == 0:
+        return []
+    arr = tensor.numpy().view(f"U{tensor.shape[1] // 4}")
+    return [s.rstrip("\x00") for s in arr.flatten()]
+
+
 class TrainingInput(TypedDict, total=False):
     """Schema for training input batch"""
 
@@ -472,6 +505,7 @@ class TrainingInput(TypedDict, total=False):
     rollout_expert_indices: Optional[Integer[torch.Tensor, "batch_size seq_len layer_num topk"]]
     pixel_values: Optional[TensorList]  # list of `batch_size` [num_patches_i, dim] tensors
     image_grid_thw: Optional[TensorList]  # list of `batch_size` [num_images_i, 3] tensors
+    trajectory_ids: Optional[torch.Tensor]
 
 
 class TrainingInputBatch(TensorBatch[TrainingInput]):

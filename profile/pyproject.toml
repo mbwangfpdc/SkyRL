@@ -15,4 +15,6 @@ dependencies = [
     "matplotlib-inline",
     "nbformat",
     "jupyter",
+    "orjson",
+    "pandas",
 ]

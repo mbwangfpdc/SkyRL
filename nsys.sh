@@ -5,25 +5,26 @@ ROOT_OUT_DIR=/local_nvme1/mborjigi/output
 
 source $SKYRL_DIR/.venv/bin/activate
 
-which python
-
 # EVIL: arguments for gpu-metrics-devices are integer IDs but DIFFERENT from those returned by nvidia-smi. what
 # we think of as gpus 0,1,2,3 are in fact 1,0,3,2 to nsys. Find out by calling sudo nsys profile --gpu-metrics-devices=help and comparing it to nvidia-smi. terrible.
-# export CUDA_VISIBLE_DEVICES=1,2,3
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 # export CUDA_LAUNCH_BLOCKING=1
 export TMPDIR=/local_nvme1/mborjigi/tmp
 export DEEPSPEED_TIMEOUT=60
 export RAY_NCCL_TIMEOUT=120
 export NCCL_TIMEOUT=120
 export NCCL_DEBUG=TRACE
+export NCCL_DEBUG_SUBSYS=COLL
+export ENABLE_NCCL_DEBUG=1
 export TORCH_DISTRIBUTED_DEBUG=INFO
+export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576
 export RAY_DEDUP_LOGS=0
 export HYDRA_FULL_ERROR=1
 export RAY_BACKEND_LOG_LEVEL=info
 export SKYRL_DUMP_INFRA_LOG_TO_STDOUT=true
 export VLLM_USE_PRECOMPILED=1
-export VLLM_PRECOMPILED_WHEEL_COMMIT=72506c98349d6bcd32b4e33eec7b5513453c1502
-export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM=0.13.0
+export VLLM_PRECOMPILED_WHEEL_COMMIT=2a69949bdadf0e8942b7a1619b229cb475beef20
+# export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM=0.13.0
 # Disables the dashboard and its associated metrics agent
 export RAY_INCLUDE_DASHBOARD=0
 # Prevents Ray from trying to export metrics to the agent
@@ -32,6 +33,7 @@ export RAY_metrics_export_port=0
 export RAY_SCHEDULER_EVENTS=0
 
 OUT_DIR=$ROOT_OUT_DIR/$1
+export CAIS_OUT_DIR=$OUT_DIR
 SCRIPT=$SKYRL_DIR/examples/train/text_to_sql/run_skyrl_sql_fast_debug_1gpu.sh
 SCRIPT=$SKYRL_DIR/examples/train/text_to_sql/run_skyrl_sql_fast_debug_3b_4gpu.sh
 SCRIPT=$SKYRL_DIR/examples/train/text_to_sql/run_skyrl_sql_fast_debug_7b_4gpu.sh
@@ -49,23 +51,29 @@ cat $SCRIPT > $OUT_DIR/script.sh
 cat $0 > $OUT_DIR/nsys_script.sh
 
 # Start CPU usage monitoring, thanks to gemini
-# (
-#   echo "Timestamp,PID,CPU%,MEM%,Command" > $OUT_DIR/cpu_metrics.csv
+(
+  echo "Timestamp,PID,CPU%,MEM%,Command" > $OUT_DIR/cpu_metrics.csv
   
-#   while true; do
-#     timestamp=$(date +"%Y-%m-%d %H:%M:%S.%3N")
-#     ps -u "$USER" -o "pid=,pcpu=,pmem=,args=" -ww --no-headers 2>/dev/null | awk -v ts="$timestamp" '{print ts "," $1 "," $2 "," $3 "," $4}' >> "$OUT_DIR/cpu_metrics.csv"
-#     sleep 0.1
-#   done
-# ) &
-# cpu_monitor_pid=$!
+  while true; do
+    timestamp=$(date +"%Y-%m-%d %H:%M:%S.%3N")
+    ps -u "$USER" -o "pid=,pcpu=,pmem=,args=" -ww --no-headers 2>/dev/null | awk -v ts="$timestamp" '{print ts "," $1 "," $2 "," $3 "," $4}' >> "$OUT_DIR/cpu_metrics.csv"
+    sleep 0.1
+  done
+) &
+cpu_monitor_pid=$!
+(
+  while true; do
+    gpustat -a >> "$OUT_DIR/gpustat.txt"
+  done
+) &
+gpustat_monitor_pid=$!
         
 nvidia-smi dmon -s umt -o DT -f $OUT_DIR/gpu_metrics.csv &
 gpu_monitor_pid=$!
-trap "echo 'Killing monitors...'; kill $cpu_monitor_pid $gpu_monitor_pid 2>/dev/null;" INT TERM HUP QUIT PIPE EXIT
+trap "echo 'Killing monitors...'; kill $cpu_monitor_pid $gpu_monitor_pid $gpustat_monitor_pid 2>/dev/null;" INT TERM HUP QUIT PIPE EXIT
 
 nsys profile --gpu-metrics-devices=1,0,3,2 --cuda-memory-usage=false --trace=cuda --cpuctxsw=process-tree --gpu-metrics-frequency=100 --force-overwrite=false --sample=process-tree --samples-per-backtrace=32 --wait=primary --delay=90 -o $OUT_DIR/nsys_report -- zsh $SCRIPT > $OUT_DIR/output.log 2>&1
-kill $cpu_monitor_pid $gpu_monitor_pid 2>/dev/null
+kill $cpu_monitor_pid $gpu_monitor_pid $gpustat_monitor_pid 2>/dev/null
 
 echo "Done! Exporting to sqlite..."
 nsys export --type=sqlite --ts-normalize=true --force-overwrite=false --output=$OUT_DIR/nsys_report.sqlite $OUT_DIR/nsys_report.nsys-rep > /dev/null 2>&1
@@ -81,7 +89,7 @@ echo "Done! merging profiler jsons..."
 
 # Note: have to activate the profiler environment for merge_profiles.py
 deactivate
-source .venv/bin/activate
-python3 merge_profiles.py $1
+source profile/.venv/bin/activate
+python3 profile/merge_profiles.py $1
 echo "Output dir: $OUT_DIR/output.log"
 echo "Output log: $OUT_DIR/output.log"

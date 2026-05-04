@@ -25,16 +25,19 @@ MODEL=Qwen/Qwen2.5-Coder-7B-Instruct
 
 # uv run --isolated --extra vllm -m examples.async.main_async \
 # uv run --isolated --extra vllm --with torchao -m skyrl_train.entrypoints.main_base \
-uv run --active --extra fsdp -m skyrl.train.entrypoints.main_base \
+uv run --active --no-sync --extra fsdp -m skyrl.train.entrypoints.main_base \
   trainer.algorithm.advantage_estimator="grpo" \
   data.train_data="['$DATA_DIR/train.parquet']" \
   data.val_data="['$DATA_DIR/validation.parquet']" \
   trainer.policy.model.path=$MODEL \
-  trainer.epochs=3 \
+  trainer.epochs=5 \
   trainer.placement.colocate_all=true \
   trainer.strategy=fsdp2 \
   trainer.policy.fsdp_config.cpu_offload=false \
   trainer.policy.fsdp_config.wrap_policy.num_model_units=-1 \
+  trainer.policy.fsdp_config.mixed_precision.param_dtype=bf16 \
+  trainer.policy.fsdp_config.mixed_precision.reduce_dtype=bf16 \
+  trainer.policy.fsdp_config.mixed_precision.buffer_dtype=bf16 \
   trainer.ref.fsdp_config.cpu_offload=true \
   trainer.policy.optimizer_config.max_grad_norm=0.5 \
   trainer.policy.sequence_parallel_size=1 \
@@ -72,6 +75,7 @@ uv run --active --extra fsdp -m skyrl.train.entrypoints.main_base \
   generator.eval_sampling_params.max_generate_length=$MAX_GENERATE_LENGTH \
   environment.skyrl_gym.text2sql.db_path=$DB_PATH \
   trainer.logger="console" \
+  trainer.log_path=$CAIS_OUT_DIR \
   trainer.project_name="skyrlsql" \
   trainer.run_name="skyrlsql_repro" \
   trainer.resume_mode=none \

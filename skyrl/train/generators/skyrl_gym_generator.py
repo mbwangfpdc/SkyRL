@@ -378,7 +378,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             with ContextTimer(log["timers"], f"engine_generate"):
                 engine_output = await self.inference_engine_client.generate(engine_input)
             step_times.append(time.time() - generate_start)
-            # logger.info(f"{session_id}:{step} took {time.time() - generate_start:.2f}s")
+            logger.info(f"{session_id}:{step} took {time.time() - generate_start:.2f}s")
             log["prompts"].append(prompt)
             if session_id == "0_0":
                 logger.info(f"Debug log for session {session_id}, step {step}: prompt: {prompt}, engine_output: {engine_output}")
@@ -579,7 +579,6 @@ class SkyRLGymGenerator(GeneratorInterface):
 
         # import json
         # print(f"{session_id} log: !@#${json.dumps(log)}!@#$")
-        
         logger.info(f"Agent loop {session_id} took {time.time() - start:.2f}s, steps: {','.join([f'{t:.2f}' for t in step_times])}, stop reason {stop_reason}")
 
         return agent_loop_output

@@ -250,6 +250,7 @@ class RayPPOTrainer:
 
                     if self.colocate_all:
                         # if we are not continuing sampling, we sleep the inference engine
+                        logger.info("Putting inference engine to sleep for training step.")
                         await self.inference_engine_client.sleep()
 
                     # 1.2 postprocess rewards (and merge step-wise turns if enabled)
@@ -352,6 +353,7 @@ class RayPPOTrainer:
 
         pbar.close()
         if self.colocate_all:
+            logger.info("Putting inference engine to sleep at the end of training.")
             await self.inference_engine_client.sleep()
 
         # Safety net: always save final checkpoint at end of training.
@@ -993,14 +995,14 @@ class RayPPOTrainer:
             - `["action_log_probs"]`: Float[torch.Tensor, "batch_size seqlen"]
             - `["values"]`: Float[torch.Tensor, "batch_size seqlen"]
         """
-        fwd_keys = ["sequences", "attention_mask"]
+        fwd_keys = ["sequences", "attention_mask", "trajectory_ids"]
         if training_input.get("rollout_expert_indices") is not None:
             fwd_keys.append("rollout_expert_indices")
         if training_input.get("pixel_values") is not None:
             fwd_keys.append("pixel_values")
         if training_input.get("image_grid_thw") is not None:
             fwd_keys.append("image_grid_thw")
-        data_fwd_pass = training_input.select(keys=fwd_keys, metadata_keys=["response_length", "trajectory_ids"])
+        data_fwd_pass = training_input.select(keys=fwd_keys, metadata_keys=["response_length"])
 
         values = None
         base_log_probs = None

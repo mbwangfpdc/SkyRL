@@ -3,6 +3,7 @@ Server Group - manages server actors with placement groups.
 """
 
 import logging
+from loguru import logger
 from argparse import Namespace
 from typing import Any, List, Optional, Type, Union
 
@@ -17,7 +18,7 @@ from skyrl.backends.skyrl_train.inference_servers.protocols import ServerActorPr
 from skyrl.backends.skyrl_train.inference_servers.server_pool import ServerActorPool
 from skyrl.train.utils.utils import ResolvedPlacementGroup
 
-logger = logging.getLogger(__name__)
+# logger = logging.getLogger(__name__)
 
 # In the colocated training case, we schedule trainig and inference actors
 # in the same placement group. In SkyRL, we further schedule actors to get information
@@ -107,6 +108,7 @@ class ServerGroup:
         logger.info(
             f"ServerGroup: actor_cls={self._server_actor_cls.__name__}, "
             f"num_servers={num_servers}, "
+            f"start_port={start_port}, "
             f"gpus_per_server={self._num_gpus_per_server}, "
             f"enable_dp={enable_dp}, enable_pd={enable_pd}, "
             f"external_pg={'yes' if self._external_pg else 'no'}"
@@ -132,8 +134,15 @@ class ServerGroup:
             self._internal_pg = self._create_placement_group()
         return self._internal_pg
 
-    def _create_actor_class(self, pg: PlacementGroup, start_bundle_idx: int) -> Any:
-        """Create actor class with scheduling constraints for a specific bundle."""
+    def _create_actor_class(
+        self, pg: PlacementGroup, start_bundle_idx: int, server_idx: int
+    ) -> Any:
+        """Create actor class with scheduling constraints for a specific bundle.
+
+        Also attach a runtime_env env var `SKYRL_ENGINE_IDX` so each actor
+        process receives a nondecreasing index (0..N-1).
+        """
+        logger.info(f"Assigning server {server_idx} to bundle index {start_bundle_idx} (logical GPU {server_idx * self._num_gpus_per_server})")
         return ray.remote(self._server_actor_cls).options(
             num_gpus=0,  # GPU allocation managed by placement group
             num_cpus=COLOCATED_ACTOR_CPU_FRACTION,
@@ -142,6 +151,9 @@ class ServerGroup:
                 placement_group_capture_child_tasks=True,
                 placement_group_bundle_index=start_bundle_idx,
             ),
+            runtime_env={
+                "env_vars": {"SKYRL_ENGINE_IDX": str(server_idx)}
+            },
         )
 
     def _get_bundle_indices_for_server(self, server_idx: int) -> List[int]:
@@ -171,7 +183,9 @@ class ServerGroup:
             bundle_indices = self._get_bundle_indices_for_server(server_idx)
             start_bundle_idx = bundle_indices[0]
 
-            ServerActorClass = self._create_actor_class(pg, start_bundle_idx)
+            ServerActorClass = self._create_actor_class(
+                pg, start_bundle_idx, server_idx
+            )
 
             gpu_ids = self._get_gpu_ids_for_server(server_idx)
             server_kwargs = self._server_actor_cls.prepare_server_kwargs(
@@ -182,6 +196,7 @@ class ServerGroup:
                 **self._server_actor_kwargs,
             )
 
+            logger.info(f"Creating actor for server {server_idx}: {bundle_indices=}, {gpu_ids=}, start_port={self._start_port + server_idx}")
             actor = ServerActorClass.remote(
                 self._cli_args,
                 self._start_port + server_idx,

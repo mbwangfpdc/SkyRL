@@ -12,6 +12,7 @@ from skyrl.backends.skyrl_train.inference_engines.inference_engine_client_http_e
     ErrorResponse,
 )
 from skyrl.train.config import SamplingParams
+from loguru import logger
 
 
 def get_vllm_sampling_params(sampling_params: Union[SamplingParams, DictConfig]) -> Dict[str, Any]:
@@ -41,6 +42,7 @@ def get_vllm_sampling_params(sampling_params: Union[SamplingParams, DictConfig])
             for key, value in sampling_params.additional_kwargs.items():
                 if key not in vllm_sampling_params:
                     vllm_sampling_params[key] = value
+    logger.info(f"Using vLLM sampling parameters: {vllm_sampling_params}")
     return vllm_sampling_params
 
 

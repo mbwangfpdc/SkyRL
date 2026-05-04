@@ -296,6 +296,8 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
         full_sd (`dict`): The full state dict to load, can be only on rank 0
     """
     import torch.distributed as dist
+    logger.info(f"[Rank {dist.get_rank()}] Starting fsdp2_load_full_state_dict: num_params={len(full_sd)}, cpu_offload={cpu_offload}")
+    import torch.distributed as dist
     from torch.distributed.tensor import distribute_tensor
 
     # Model was previously copied to meta device
@@ -329,7 +331,8 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
         return tensor
 
     if dist.get_rank() == 0:
-        for (param_name, full_param), sharded_param in zip(full_sd.items(), meta_sharded_sd.values()):
+        logger.info(f"[Rank 0] Broadcasting {len(full_sd)} parameters to other ranks...")
+        for idx, ((param_name, full_param), sharded_param) in enumerate(zip(full_sd.items(), meta_sharded_sd.values())):
             full_param = full_param.detach().cuda()
             mesh = sharded_param.device_mesh
             dist.broadcast(full_param, src=0)
@@ -341,9 +344,14 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
             )
             sharded_tensor = _cast_and_contiguous(sharded_tensor, to_contiguous, casting_dtype)
             sharded_sd[param_name] = sharded_tensor
+            if idx == 0:
+                logger.debug(f"[Rank 0] First param: {param_name}, shape={sharded_param.shape}, dtype={sharded_param.dtype}")
+        logger.info(f"[Rank 0] Broadcast complete for all {len(sharded_sd)} parameters")
     # We need this else to have a matching `broadcast` for all of the ranks, else we deadlock
     else:
-        for param_name, sharded_param in meta_sharded_sd.items():
+        logger.info(f"[Rank {dist.get_rank()}] Receiving {len(meta_sharded_sd)} parameters from rank 0...")
+        for idx, param_name in enumerate(meta_sharded_sd.keys()):
+            sharded_param = meta_sharded_sd[param_name]
             full_tensor = torch.empty(sharded_param.size(), device="cuda", dtype=sharded_param.dtype)
             mesh = sharded_param.device_mesh
             dist.broadcast(full_tensor, src=0)
@@ -355,27 +363,39 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
             )
             sharded_tensor = _cast_and_contiguous(sharded_tensor, to_contiguous, casting_dtype)
             sharded_sd[param_name] = sharded_tensor
+            if idx == 0:
+                logger.debug(f"[Rank {dist.get_rank()}] First param: {param_name}, shape={sharded_param.shape}, dtype={sharded_param.dtype}")
+        logger.info(f"[Rank {dist.get_rank()}] Received {len(sharded_sd)} parameters")
 
     # we set `assign=True` because our params can be on meta device
+    logger.info(f"[Rank {dist.get_rank()}] Loading {len(sharded_sd)} parameters into model...")
     model.load_state_dict(sharded_sd, assign=True)
+    logger.info(f"[Rank {dist.get_rank()}] State dict loaded successfully")
 
     # Broadcast non-persistent buffers (e.g. inv_freq from RotaryEmbedding) that
     # are excluded from state_dict.  On non-rank-0 meta-init these are still on
     # meta device with no data; rank 0 has the correctly computed values.
+    logger.info(f"[Rank {dist.get_rank()}] Syncing non-persistent buffers...")
     _sync_non_persistent_buffers(model, sharded_sd)
+    logger.info(f"[Rank {dist.get_rank()}] Non-persistent buffers synced")
 
     # If we don't offload FSDP2 Module to CPU and then back to GPU,
     # it will occupy a large amount of reserved GPU memory，which can not be released using torch.cuda.empty_cache()
     # even if we are using cpu_offload
     # TODO (erictang000): this requires an additional offload + backload, see if this can be avoided
     # Credit: https://github.com/volcengine/verl/pull/1667
+    logger.info(f"[Rank {dist.get_rank()}] Offloading model to CPU to free GPU memory...")
     offload_fsdp2_model_to_cpu(model)
+    logger.info(f"[Rank {dist.get_rank()}] Model offloaded to CPU")
 
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
 
     if not cpu_offload:
+        logger.info(f"[Rank {dist.get_rank()}] Loading model back to GPU...")
         load_fsdp2_model_to_gpu(model)
+        logger.info(f"[Rank {dist.get_rank()}] Model loaded to GPU")
+    logger.info(f"[Rank {dist.get_rank()}] fsdp2_load_full_state_dict complete")
     return model
 
 
@@ -396,37 +416,50 @@ def fsdp2_get_full_state_dict(model: torch.nn.Module, cpu_offload=True, rank0_on
         StateDictOptions,
         get_model_state_dict,
     )
+    
+    logger.info(f"[Rank {dist.get_rank()}] Starting fsdp2_get_full_state_dict: cpu_offload={cpu_offload}, rank0_only={rank0_only}")
 
     # All ranks must participate in the collective operation
     options = StateDictOptions(
         full_state_dict=True, cpu_offload=cpu_offload, broadcast_from_rank0=False  # We want to get, not set
     )
+    logger.info(f"[Rank {dist.get_rank()}] StateDictOptions: {options}")
 
     # This must be called on all ranks for the collective operation to work
+    logger.info(f"[Rank {dist.get_rank()}] Gathering state dict from model...")
     state_dict = get_model_state_dict(model, options=options)
+    logger.info(f"[Rank {dist.get_rank()}] State dict retrieved: {len(state_dict)} entries")
 
     # If rank0_only is True, clear the state_dict on non-rank-0 processes
     if rank0_only and dist.get_rank() != 0:
         # Clear the state dict on non-rank-0 processes to save memory
+        logger.info(f"[Rank {dist.get_rank()}] Clearing state dict on non-rank-0 process to save memory")
         state_dict.clear()
+    elif rank0_only and dist.get_rank() == 0:
+        logger.info(f"[Rank 0] Keeping full state dict with {len(state_dict)} parameters")
 
     return state_dict
 
 @time_func("apply_fsdp2")
 def apply_fsdp2(model, fsdp_kwargs, config: Union[FSDPConfig, DictConfig]):
+    # TODO(mbwang): Figure out whether this is working properly
     """model: AutoModelForCausalLM"""
     assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
     
-    # # Check if num_model_units is specified
-    # num_model_units = config.get("wrap_policy", {}).get("num_model_units", None)
+    logger.info(f"Starting apply_fsdp2: fsdp_kwargs={fsdp_kwargs}")
+    logger.info(f"FSDP2 Config: {config}")
     
-    # if num_model_units is not None and num_model_units == 1:
-    #     # Wrap entire model as a single FSDP unit without wrapping submodules
-    #     logger.info("Wrapping entire model as single unit.")
-    #     fully_shard(model, **fsdp_kwargs)
-    #     return
+    # Check if num_model_units is specified
+    num_model_units = config.wrap_policy.get("num_model_units", None)
+    
+    if num_model_units is not None and num_model_units == 1:
+        # Wrap entire model as a single FSDP unit without wrapping submodules
+        logger.info("Wrapping entire model as single unit.")
+        fully_shard(model, **fsdp_kwargs)
+        return
 
     default_transformer_cls_names_to_wrap = getattr(model, "_no_split_modules", None)
+    logger.info(f"Default transformer classes to wrap: {default_transformer_cls_names_to_wrap}")
     fsdp_transformer_layer_cls_to_wrap = (
         config.wrap_policy.get("transformer_layer_cls_to_wrap", None)
         if getattr(config, "wrap_policy", {}).get("transformer_layer_cls_to_wrap", None)
@@ -439,6 +472,7 @@ def apply_fsdp2(model, fsdp_kwargs, config: Union[FSDPConfig, DictConfig]):
         fsdp_transformer_layer_cls_to_wrap = list(fsdp_transformer_layer_cls_to_wrap)
 
     assert len(fsdp_transformer_layer_cls_to_wrap) > 0 and fsdp_transformer_layer_cls_to_wrap[0] is not None
+    logger.info(f"FSDP2 transformer layer classes to wrap: {fsdp_transformer_layer_cls_to_wrap}")
 
     modules = []
     for name, module in model.named_modules():
@@ -446,24 +480,28 @@ def apply_fsdp2(model, fsdp_kwargs, config: Union[FSDPConfig, DictConfig]):
             isinstance(module, nn.Embedding) and not model.config.tie_word_embeddings
         ):
             modules.append(module)
+    
+    logger.info(f"FSDP2 found {len(modules)} modules to wrap: {[m.__class__.__name__ for m in modules[:10]]}{'...' if len(modules) > 10 else ''}")
 
-    # if num_model_units is not None and num_model_units > 1:
-    #     pass
-    #     # import math
-    #     # total_params = sum(p.numel() for p in model.parameters())
-    #     # target_params = math.ceil(total_params / num_model_units)
-    #     # logger.info(f"Using num_model_units={num_model_units}, target_params per unit={target_params}")
-    #     # min_params = int(target_params * 0.9)  # Example threshold, adjust as needed
-    #     # max_params = int(target_params * 1.1)  # Example threshold, adjust as needed
+    if num_model_units is not None and num_model_units > 1:
+        pass
+        # import math
+        # total_params = sum(p.numel() for p in model.parameters())
+        # target_params = math.ceil(total_params / num_model_units)
+        # logger.info(f"Using num_model_units={num_model_units}, target_params per unit={target_params}")
+        # min_params = int(target_params * 0.9)  # Example threshold, adjust as needed
+        # max_params = int(target_params * 1.1)  # Example threshold, adjust as needed
             
-    #     # logger.info(f"Targeting shards between {min_params:,} and {max_params:,} parameters")
-    # else:
-    #     # Default: wrap each layer individually
-    #     logger.info(f"Wrapping {len(modules)} modules individually. Names: {[module.__class__.__name__ for module in modules]}")
-    #     for idx, module in enumerate(modules):
-    #         fully_shard(module, **fsdp_kwargs)
-            
+        # logger.info(f"Targeting shards between {min_params:,} and {max_params:,} parameters")
+    else:
+        # Default: wrap each layer individually
+        logger.info(f"Wrapping {len(modules)} modules individually. Names: {[module.__class__.__name__ for module in modules]}")
+        for idx, module in enumerate(modules):
+            fully_shard(module, **fsdp_kwargs)
+    
+    logger.info(f"Applying fully_shard to root model with fsdp_kwargs: {fsdp_kwargs}")
     fully_shard(model, **fsdp_kwargs)  # fsdp2 will not reshard_after_forward for root module
+    logger.info(f"Successfully applied FSDP2 to model")
 
 
 def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinite=False, foreach=None):
@@ -484,11 +522,15 @@ def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinit
 
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
+        logger.info(f"Creating FSDP2 device mesh: world_size={world_size}, mesh_shape=(fsdp)")
         device_mesh = init_device_mesh("cuda", mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
     else:
+        mesh_shape = (world_size // fsdp_size, fsdp_size)
+        logger.info(f"Creating hybrid FSDP2 device mesh: world_size={world_size}, fsdp_size={fsdp_size}, mesh_shape={mesh_shape} (ddp x fsdp)")
         device_mesh = init_device_mesh(
-            "cuda", mesh_shape=(world_size // fsdp_size, fsdp_size), mesh_dim_names=["ddp", "fsdp"]
+            "cuda", mesh_shape=mesh_shape, mesh_dim_names=["ddp", "fsdp"]
         )
+    logger.info(f"Device mesh created: ndim={device_mesh.ndim}, shape={device_mesh.shape}")
     return device_mesh
 
 
@@ -497,8 +539,10 @@ def get_sharding_strategy(device_mesh):
 
     if device_mesh.ndim == 1:
         sharding_strategy = ShardingStrategy.FULL_SHARD
+        logger.info(f"Using FULL_SHARD strategy for 1D device mesh")
     elif device_mesh.ndim == 2:
         sharding_strategy = ShardingStrategy.HYBRID_SHARD
+        logger.info(f"Using HYBRID_SHARD strategy for 2D device mesh {device_mesh.shape}")
     else:
         raise NotImplementedError(f"Get device mesh ndim={device_mesh.ndim}, but only support 1 or 2")
     return sharding_strategy

@@ -485,4 +485,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from pprint import pprint
+    pprint(os.environ)
     main()

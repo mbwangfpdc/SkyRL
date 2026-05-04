@@ -112,6 +112,14 @@ class DistributedTorchRayActor:
         os.environ["MASTER_PORT"] = str(self._master_port)
         os.environ["WORLD_SIZE"] = str(self._world_size)
         os.environ["RANK"] = str(self._rank)
+        
+        # Enable NCCL debugging for timeout diagnostics
+        if os.environ.get("ENABLE_NCCL_DEBUG") == "1":
+            os.environ["NCCL_DEBUG"] = "INFO"
+            os.environ["NCCL_DEBUG_SUBSYS"] = "COLL"
+            os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
+            logger.info(f"[Rank {self._rank}] NCCL debugging enabled")
+        
         # NOTE: Ray will automatically set the CUDA_VISIBLE_DEVICES
         # environment variable for each actor, so always set device to 0
         # os.environ["LOCAL_RANK"] = str(self._local_rank)
@@ -786,6 +794,13 @@ class PolicyWorkerBase(Worker):
         with Timer("forward_backward_micro__to_device"):
             experience.to_device(torch.cuda.current_device())
 
+        # Log model parameter memory usage
+        try:
+            model_param_size = sum(p.numel() * p.element_size() for p in self.model.parameters()) / 1024 / 1024
+            logger.info(f"Model parameter memory: {model_param_size:.2f}MB")
+        except Exception as e:
+            logger.info(f"Could not compute model param size: {e}")
+        
         sequences = experience.sequences
         old_action_log_probs = experience.action_log_probs
         base_action_log_probs = (
@@ -797,6 +812,23 @@ class PolicyWorkerBase(Worker):
         loss_mask = experience.loss_mask
         action_mask = experience.action_mask
         rollout_action_logprobs = experience.rollout_logprobs
+
+        # Log input tensor shapes and sizes for debugging OOM
+        def _tensor_info_str(tensor, name):
+            if tensor is None:
+                return f"{name}: None"
+            return f"{name}: shape={tuple(tensor.shape)}, dtype={tensor.dtype}, size_mb={tensor.numel() * tensor.element_size() / 1024 / 1024:.2f}"
+        
+        logger.info(f"=== Forward/Backward Micro Batch Input Tensors ===")
+        logger.info(_tensor_info_str(sequences, "sequences"))
+        logger.info(_tensor_info_str(old_action_log_probs, "old_action_log_probs"))
+        logger.info(_tensor_info_str(base_action_log_probs, "base_action_log_probs"))
+        logger.info(_tensor_info_str(advantages, "advantages"))
+        logger.info(f"num_actions: {num_actions}")
+        logger.info(_tensor_info_str(attention_mask, "attention_mask"))
+        logger.info(_tensor_info_str(loss_mask, "loss_mask"))
+        logger.info(_tensor_info_str(action_mask, "action_mask"))
+        logger.info(_tensor_info_str(rollout_action_logprobs, "rollout_action_logprobs"))
 
         # Determine which loss function to use
         resolved_loss_name = loss_fn if loss_fn is not None else self.cfg.algorithm.policy_loss_type
@@ -819,9 +851,14 @@ class PolicyWorkerBase(Worker):
             loss_config = type(loss_config).from_dict_config(new_loss_config)
 
         # TODO (sumanthrh): don't think this does anything for fsdp rn because autocast happens internally
+        # Log memory before forward pass
+        from skyrl.backends.skyrl_train.utils.memory_utils import log_gpu_memory, log_gpu_memory_delta, check_memory_pressure
+        mem_before_forward = log_gpu_memory("before_forward", level="info")
+        
         with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             # actor loss
             with Timer("PolicyWorkerBase._forward_backward_micro__forward"):
+                logger.info(f"Starting model forward pass with sequences shape {sequences.shape}")
                 action_log_probs, output = self.model(
                     sequences,
                     num_actions,
@@ -833,6 +870,19 @@ class PolicyWorkerBase(Worker):
                     pixel_values=experience.pixel_values,
                     image_grid_thw=experience.image_grid_thw,
                 )
+                logger.info(f"Forward pass complete. action_log_probs shape: {action_log_probs.shape}")
+            
+            # Log memory after forward, before loss computation
+            mem_after_forward = log_gpu_memory("after_forward", level="info")
+            log_gpu_memory_delta("forward_pass", mem_before_forward, level="info")
+            check_memory_pressure(threshold_pct=85.0)
+            
+            # Log output shapes and sizes
+            if isinstance(output, dict):
+                for k, v in output.items():
+                    if isinstance(v, torch.Tensor):
+                        logger.info(f"output[{k}]: shape={tuple(v.shape)}, dtype={v.dtype}, size_mb={v.numel() * v.element_size() / 1024 / 1024:.2f}")
+            
             # loss function
             # TODO: recompute advantages
             with Timer("PolicyWorkerBase._forward_backward_micro__compute_loss"):
@@ -845,11 +895,30 @@ class PolicyWorkerBase(Worker):
                     rollout_logprobs=rollout_action_logprobs,
                 )
 
+        # Log memory before backward pass
+        mem_before_backward = log_gpu_memory("before_backward", level="info")
+        
+        def _log_memory_snapshot(label):
+            """Log detailed CUDA memory stats with rank info."""
+            try:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+                stats = torch.cuda.memory_stats()
+                allocated = torch.cuda.memory_allocated() / 1024 / 1024
+                reserved = torch.cuda.memory_reserved() / 1024 / 1024
+                logger.info(f"[Rank {rank}][{label}] Allocated: {allocated:.2f}MB, Reserved: {reserved:.2f}MB, "
+                              f"Blocks allocated: {stats.get('allocated_bytes.all.allocated', 0)}")
+            except Exception as e:
+                logger.info(f"[{label}] Could not get memory stats: {e}")
+        
+        _log_memory_snapshot("BEFORE_backward")
+        
         # SFT path: skip KL/entropy terms, return per-token outputs for Tinker API
         if resolved_loss_name == "cross_entropy":
             unscaled_loss = policy_loss
             loss = unscaled_loss * microbatch_weight
             self.strategy.backward(loss, self.model, self.optimizer)
+            
+            _log_memory_snapshot("AFTER_backward_sft")
 
             # Compute elementwise loss for Tinker API (per-token NLL)
             with torch.no_grad():
@@ -922,7 +991,16 @@ class PolicyWorkerBase(Worker):
             # so we just average them across microbatches and DP workers.
             loss = policy_loss * grad_sum_correction_factor + (kl_loss_term - entropy_loss_term) * microbatch_weight
             unscaled_loss = loss / grad_sum_correction_factor
+            
+            _log_memory_snapshot("BEFORE_backward_strategy.backward")
+            logger.info(f"About to call backward: loss={loss.item():.4f}, grad_sum_correction_factor={grad_sum_correction_factor}")
+            
             self.strategy.backward(loss, self.model, self.optimizer)
+            
+            _log_memory_snapshot("AFTER_backward_rl")
+            # Log memory after backward pass
+            log_gpu_memory_delta("backward_pass", mem_before_backward, level="info")
+            check_memory_pressure(threshold_pct=85.0)
 
             # Build per-sequence loss_fn_outputs with logprobs.
             batch_size = action_log_probs.shape[0]

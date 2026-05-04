@@ -45,6 +45,9 @@ class ServerActorPool:
         self._start_refs = [actor.start.remote() for actor in self._actors]
         if blocking:
             self._server_infos = ray.get(self._start_refs)
+            # log detailed server info for debugging
+            for i, info in enumerate(self._server_infos):
+                logger.info(f"ServerActorPool: started server {i}: ip={info.ip} port={info.port} url={info.url}")
             return self._server_infos
         return self._start_refs
 
@@ -58,6 +61,7 @@ class ServerActorPool:
         """
         if not self._server_infos and self._start_refs:
             self._server_infos = ray.get(self._start_refs)
+            logger.debug(f"ServerActorPool: resolved server_infos: {[ (s.ip, s.port, s.url) for s in self._server_infos ]}")
         return self._server_infos
 
     def get_server_urls(self) -> List[str]:

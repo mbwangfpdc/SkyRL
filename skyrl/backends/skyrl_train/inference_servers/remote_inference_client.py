@@ -48,7 +48,6 @@ Comparison with existing code:
 from __future__ import annotations
 
 import asyncio
-import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import (
@@ -94,7 +93,7 @@ if TYPE_CHECKING:
     )
 
 
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 
 def _extract_session_id_and_body(
@@ -274,6 +273,7 @@ class RemoteInferenceClient:
         sleep briefly to let the connector detect and purge dead sockets
         before the next attempt.
         """
+        logger.info(f"POST {url} with headers {headers}")
         session = await self._get_session()
         last_exc: Optional[Exception] = None
         for attempt in range(_DATA_PLANE_RETRIES):
@@ -333,6 +333,7 @@ class RemoteInferenceClient:
             InferenceEngineOutput with responses, response_ids, and stop_reasons.
         """
 
+        logger.info(f"Generating for session ids: {input_batch.get('session_ids')}")
         prompt_token_ids = input_batch.get("prompt_token_ids")
         if prompt_token_ids is None:
             raise ValueError("RemoteInferenceClient only accepts `prompt_token_ids`, not `prompts`.")
@@ -425,6 +426,7 @@ class RemoteInferenceClient:
             "sampling_params": sampling_params,
             "model": effective_model,
             "token_ids": prompt_token_ids,
+            "request_id": str(session_id) if session_id else None,
         }
         if mm_features:
             payload["features"] = mm_features
@@ -432,7 +434,9 @@ class RemoteInferenceClient:
         headers = {"Content-Type": "application/json"}
         if session_id:
             headers["X-Session-ID"] = str(session_id)
+            headers["x-request-id"] = str(session_id)
 
+        logger.info(f"Making post call to {url} with headers: {headers}")
         response = await self._post(url, json=payload, headers=headers)
 
         choice = response["choices"][0]
@@ -513,6 +517,7 @@ class RemoteInferenceClient:
         headers = {"Content-Type": "application/json"}
         if session_id:
             headers["X-Session-ID"] = str(session_id)
+            headers["x-request-id"] = str(session_id)
 
         url = f"{self.proxy_url}/inference/v1/generate"
         gen_sem, _ = self._get_semaphores()
@@ -594,6 +599,7 @@ class RemoteInferenceClient:
         headers = {"Content-Type": "application/json"}
         if session_id:
             headers["X-Session-ID"] = str(session_id)
+            headers["x-request-id"] = str(session_id)
 
         url = f"{self.proxy_url}/v1/chat/completions"
         gen_sem, _ = self._get_semaphores()
@@ -623,6 +629,7 @@ class RemoteInferenceClient:
         headers = {"Content-Type": "application/json"}
         if session_id:
             headers["X-Session-ID"] = str(session_id)
+            headers["x-request-id"] = str(session_id)
 
         url = f"{self.proxy_url}/v1/chat/completions/render"
         gen_sem, _ = self._get_semaphores()
@@ -652,6 +659,7 @@ class RemoteInferenceClient:
         headers = {"Content-Type": "application/json"}
         if session_id:
             headers["X-Session-ID"] = str(session_id)
+            headers["x-request-id"] = str(session_id)
 
         url = f"{self.proxy_url}/v1/completions"
         gen_sem, _ = self._get_semaphores()
@@ -779,6 +787,7 @@ class RemoteInferenceClient:
         Returns:
             Dict mapping server_url to response.
         """
+        logger.info(f"Calling {method} {endpoint} on all servers")
         results = await asyncio.gather(
             *[self._call_server(url, endpoint, json, method, params) for url in self.server_urls]
         )

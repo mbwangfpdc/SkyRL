@@ -439,11 +439,11 @@ class WorkerDispatch:
             await self._offload("policy", offload_optimizer=True, offload_model=False)
 
     @time_func("WorkerDispatch.finish_weight_sync")
-    def finish_weight_sync(self) -> None:
+    async def finish_weight_sync(self) -> None:
         """Finish weight sync: offload model weights and optimizer state."""
         if not self.colocate_all:
             return
-        self._offload("policy", offload_optimizer=True, offload_model=True)
+        await self._offload("policy", offload_optimizer=True, offload_model=True)
 
     async def save_weights_for_sampler(self) -> None:
         """
@@ -461,16 +461,16 @@ class WorkerDispatch:
         await self.prepare_for_weight_sync()
         if self.colocate_all:
             await self._inference_engine_client.wake_up(tags=["weights"])
-            self.broadcast_to_inference_engines(self._inference_engine_client)
-            self.finish_weight_sync()
+            await self.broadcast_to_inference_engines(self._inference_engine_client)
+            await self.finish_weight_sync()
             await self._inference_engine_client.wake_up(tags=["kv_cache"])
         else:
             # Non-colocated: pause generation to prevent in-flight requests from
             # reading partially-updated weights during the NCCL broadcast.
             await self._inference_engine_client.pause_generation()
             try:
-                self.broadcast_to_inference_engines(self._inference_engine_client)
-                self.finish_weight_sync()
+                await self.broadcast_to_inference_engines(self._inference_engine_client)
+                await self.finish_weight_sync()
             finally:
                 await self._inference_engine_client.resume_generation()
 

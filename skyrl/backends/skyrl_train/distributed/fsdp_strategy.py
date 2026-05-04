@@ -118,6 +118,10 @@ class FSDPStrategy(DistributedStrategy):
 
         # Initializes the distributed backend which will take care of synchronizing nodes/GPUs
         self.world_size = dist.get_world_size()
+        
+        # Log initial GPU memory state
+        from skyrl.backends.skyrl_train.utils.memory_utils import log_gpu_memory
+        log_gpu_memory("setup_distributed_start")
 
         self.device_mesh = create_device_mesh(world_size=self.world_size, fsdp_size=self.fsdp_config.fsdp_size)
 
@@ -130,6 +134,10 @@ class FSDPStrategy(DistributedStrategy):
 
         For all cases except fsdp2 with cpu_offload=True, we need to manually offload weights/optimizer to cpu.
         """
+        from skyrl.backends.skyrl_train.utils.memory_utils import log_gpu_memory, log_gpu_memory_delta
+        
+        mem_before_offload = log_gpu_memory("before_offload_to_cpu")
+        
         if isinstance(model, HFModelWrapper):
             model = model.model
         else:
@@ -137,17 +145,25 @@ class FSDPStrategy(DistributedStrategy):
 
         if self.manual_offload:
             if offload_model:
+                logger.info(f"Offloading model to CPU (manual_offload={self.manual_offload})...")
                 offload_fsdp_model_to_cpu(model, empty_cache=True)
 
             if optimizer is not None and self.manual_offload_optimizer and offload_optimizer:
+                logger.info(f"Offloading optimizer to CPU...")
                 offload_fsdp_optimizer(optimizer)
 
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
+        
+        log_gpu_memory_delta("offload_to_cpu", mem_before_offload)
 
     @time_func("FSDPStrategy.backload_to_gpu")
     def backload_to_gpu(self, model, optimizer, non_blocking=True, backload_optimizer=True, backload_model=True):
         """Reload model weights back to GPU."""
+        from skyrl.backends.skyrl_train.utils.memory_utils import log_gpu_memory, log_gpu_memory_delta
+        
+        mem_before_backload = log_gpu_memory("before_backload_to_gpu")
+        
         if isinstance(model, HFModelWrapper):
             model = model.model
         else:
@@ -156,16 +172,22 @@ class FSDPStrategy(DistributedStrategy):
         # if we are using fsdp 1 or cpu offload is off for fsdp2, then we need to manually backload weights/optimizer to gpu
         if self.manual_offload:
             if backload_model:
+                logger.info(f"Backloading model to GPU (manual_offload={self.manual_offload})...")
                 load_fsdp_model_to_gpu(model)
             if optimizer is not None and self.manual_offload_optimizer and backload_optimizer:
+                logger.info(f"Backloading optimizer to GPU...")
                 load_fsdp_optimizer(optimizer, torch.cuda.current_device())
 
         torch.cuda.synchronize()
+        log_gpu_memory_delta("backload_to_gpu", mem_before_backload)
 
     @time_func("FSDPStrategy.backward")
     def backward(self, loss: torch.Tensor, model, optimizer: optim.Optimizer, **kwargs) -> None:
         """Perform backward pass"""
+        from skyrl.backends.skyrl_train.utils.memory_utils import log_gpu_memory
+        log_gpu_memory("strategy_backward_start")
         loss.backward()
+        log_gpu_memory("strategy_backward_end")
 
     @time_func("FSDPStrategy.optimizer_step")
     def optimizer_step(

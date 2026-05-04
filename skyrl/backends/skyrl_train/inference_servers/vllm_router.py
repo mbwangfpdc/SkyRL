@@ -24,7 +24,8 @@ from skyrl.backends.skyrl_train.inference_servers.common import (
 )
 from skyrl.env_vars import SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S
 
-logger = logging.getLogger(__name__)
+# logger = logging.getLogger(__name__)
+from loguru import logger
 
 
 def _run_router_with_logging(router_args: RouterArgs, log_file: Optional[str]) -> None:
@@ -131,8 +132,12 @@ class VLLMRouter:
                 f"{len(self._router_args.prefill_urls)} prefill, "
                 f"{len(self._router_args.decode_urls)} decode"
             )
+            # Debug actual URL lists to help trace bad/malformed entries
+            logger.debug(f"VLLMRouter prefill_urls: {self._router_args.prefill_urls}")
+            logger.debug(f"VLLMRouter decode_urls: {self._router_args.decode_urls}")
         else:
             logger.info(f"VLLMRouter started at {router_url}: " f"{len(self._router_args.worker_urls)} workers")
+            logger.debug(f"VLLMRouter worker_urls: {self._router_args.worker_urls}")
 
         if self._log_file:
             logger.info(f"VLLMRouter logs: {self._log_file}")

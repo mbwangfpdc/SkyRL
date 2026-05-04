@@ -138,6 +138,16 @@ def create_inference_servers(
 
         server_urls = prefill_urls + decode_urls
 
+        # Trace details to help diagnose malformed/incorrect URLs
+        logger.info(f"Collected prefill_urls={prefill_urls}")
+        logger.info(f"Collected decode_urls={decode_urls}")
+        for gi, g in enumerate(prefill_server_groups):
+            for si, info in enumerate(g.server_infos):
+                logger.debug(f"Prefill group {gi} server {si}: ip={info.ip} port={info.port} url={info.url}")
+        for gi, g in enumerate(decode_server_groups):
+            for si, info in enumerate(g.server_infos):
+                logger.debug(f"Decode group {gi} server {si}: ip={info.ip} port={info.port} url={info.url}")
+
         router_args = build_router_args(ie_cfg, prefill_urls=prefill_urls, decode_urls=decode_urls)
         router = VLLMRouter(router_args, log_path=log_path)
         proxy_url = router.start()
@@ -156,18 +166,25 @@ def create_inference_servers(
         # When not colocated, create a shared PG for all engine groups so
         # that bundle offsets index into a valid range.
         if placement_group is None:
+            logger.info("Creating shared placement group for non-colocated setup")
             total_gpus = ie_cfg.num_engines * gpus_per_server * ie_cfg.data_parallel_size
             bundles = [{"GPU": 1, "CPU": 1} for _ in range(total_gpus)]
             raw_pg = ray_placement_group(bundles, strategy="PACK")
             get_ray_pg_ready_with_timeout(raw_pg, timeout=SKYRL_RAY_PG_TIMEOUT_IN_S)
             placement_group = ResolvedPlacementGroup(raw_pg)
 
+        for i in range(ie_cfg.num_engines):
+            logger.info(
+                f"Configuring ServerGroup {i}: num_servers={ie_cfg.data_parallel_size}, "
+                f"start_port={VLLM_START_PORT + i * ie_cfg.data_parallel_size * 10}, "
+                f"placement_group_bundle_offset={i * gpus_per_server * ie_cfg.data_parallel_size}"
+            )
         server_groups = [
             ServerGroup(
                 cli_args=cli_args,
                 num_servers=ie_cfg.data_parallel_size,
                 placement_group=placement_group,
-                start_port=VLLM_START_PORT + i * ie_cfg.data_parallel_size,
+                start_port=VLLM_START_PORT + i * ie_cfg.data_parallel_size * 10,  # leave port space between groups to reduce risk of collisions
                 enable_dp=ie_cfg.data_parallel_size > 1,
                 distributed_executor_backend=ie_cfg.distributed_executor_backend,
                 placement_group_bundle_offset=i * gpus_per_server * ie_cfg.data_parallel_size,
@@ -185,6 +202,12 @@ def create_inference_servers(
 
         # Collect URLs — refs are already resolved so lazy property returns immediately
         server_urls = [info.url for g in server_groups for info in g.server_infos]
+
+        # Trace details to help diagnose malformed/incorrect URLs
+        logger.info(f"Collected server_urls={server_urls}")
+        for gi, g in enumerate(server_groups):
+            for si, info in enumerate(g.server_infos):
+                logger.debug(f"Group {gi} server {si}: ip={info.ip} port={info.port} url={info.url}")
 
         router_args = build_router_args(ie_cfg, server_urls=server_urls)
         router = VLLMRouter(router_args, log_path=log_path)

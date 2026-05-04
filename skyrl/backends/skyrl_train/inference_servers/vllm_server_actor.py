@@ -39,7 +39,8 @@ from skyrl.env_vars import (
     SKYRL_WAIT_UNTIL_INFERENCE_SERVER_HEALTHY_TIMEOUT_S,
 )
 
-logger = logging.getLogger(__name__)
+# logger = logging.getLogger(__name__)
+from loguru import logger
 
 
 class VLLMServerActor(ServerActorProtocol):
@@ -131,6 +132,7 @@ class VLLMServerActor(ServerActorProtocol):
         self._ip = get_node_ip()
         self._port, self._port_reservation = find_and_reserve_port(start_port)
         self._server_idx = server_idx
+        logger.info(f"Server {server_idx}: reserved port {self._port} for vLLM server")
         self._num_gpus_per_server = self.compute_num_gpus_per_server(vllm_cli_args)
         self._use_mp_backend = distributed_executor_backend == "mp"
 
@@ -303,6 +305,9 @@ class VLLMServerActor(ServerActorProtocol):
     async def _run_server(self) -> None:
         """Internal method to run the HTTP server."""
         # Release the port reservation right before vLLM rebinds.
+        # TODO(mbwang): race condition! Another process can steal our
+        # "reserved" port after this close happens, and before create_server_socket
+        # re-binds it.
         if self._port_reservation is not None:
             self._port_reservation.close()
             self._port_reservation = None

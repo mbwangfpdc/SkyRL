@@ -86,7 +86,7 @@ class PromptDataset:
         logger.info(f"Filtered dataset size: {len(self.dataframe)}")
 
         assert self.batch_size is not None
-        MAX_BATCHES = 1
+        MAX_BATCHES = 3
         if len(self.dataframe) > self.batch_size * MAX_BATCHES:
             logger.info(f"Sampling {MAX_BATCHES} batches for faster iteration during development.")
             self.dataframe = self.dataframe.select(range(0, self.batch_size * MAX_BATCHES))

@@ -82,7 +82,10 @@ from skyrl.train.utils.utils import (
     ray_noset_visible_devices,
     Timer,
     time_func,
+    gpu_memory_tracker
 )
+
+from functools import partial
 
 _SET_AFFINITY = False
 
@@ -92,6 +95,7 @@ if TYPE_CHECKING:
     )
     from skyrl.train.config.config import InferenceEngineConfig
 
+gpu_memory_tracker = partial(gpu_memory_tracker, logger=logger)
 
 # Adapted from OpenRLHF: https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/trainer/ray/launcher.py#L17
 class DistributedTorchRayActor:
@@ -737,9 +741,10 @@ class PolicyWorkerBase(Worker):
         for i, micro_batch in enumerate(BatchIterator(data, micro_batch_size, drop_last=False)):
             def do_step():
                 microbatch_weight = micro_batch_size / len(data)
-                metrics = self._forward_backward_micro(
-                    micro_batch, microbatch_weight, loss_fn=loss_fn, loss_fn_config=loss_fn_config
-                )
+                with gpu_memory_tracker(f"forward_backward_micro_batch_{i}"):
+                    metrics = self._forward_backward_micro(
+                        micro_batch, microbatch_weight, loss_fn=loss_fn, loss_fn_config=loss_fn_config
+                    )
 
                 # Extract loss_fn_outputs before reduce_metrics (it's not a scalar metric)
                 if "loss_fn_outputs" in metrics:
@@ -770,6 +775,7 @@ class PolicyWorkerBase(Worker):
 
         return result
 
+    @time_func("PolicyWorkerBase._forward_backward_micro")
     def _forward_backward_micro(
         self,
         experience: Experience,
@@ -851,13 +857,9 @@ class PolicyWorkerBase(Worker):
             loss_config = type(loss_config).from_dict_config(new_loss_config)
 
         # TODO (sumanthrh): don't think this does anything for fsdp rn because autocast happens internally
-        # Log memory before forward pass
-        from skyrl.backends.skyrl_train.utils.memory_utils import log_gpu_memory, log_gpu_memory_delta, check_memory_pressure
-        mem_before_forward = log_gpu_memory("before_forward", level="info")
-        
         with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             # actor loss
-            with Timer("PolicyWorkerBase._forward_backward_micro__forward"):
+            with Timer("PolicyWorkerBase._forward_backward_micro__forward"), gpu_memory_tracker("forward_backward_micro_forward"):
                 logger.info(f"Starting model forward pass with sequences shape {sequences.shape}")
                 action_log_probs, output = self.model(
                     sequences,
@@ -872,11 +874,6 @@ class PolicyWorkerBase(Worker):
                 )
                 logger.info(f"Forward pass complete. action_log_probs shape: {action_log_probs.shape}")
             
-            # Log memory after forward, before loss computation
-            mem_after_forward = log_gpu_memory("after_forward", level="info")
-            log_gpu_memory_delta("forward_pass", mem_before_forward, level="info")
-            check_memory_pressure(threshold_pct=85.0)
-            
             # Log output shapes and sizes
             if isinstance(output, dict):
                 for k, v in output.items():
@@ -885,7 +882,7 @@ class PolicyWorkerBase(Worker):
             
             # loss function
             # TODO: recompute advantages
-            with Timer("PolicyWorkerBase._forward_backward_micro__compute_loss"):
+            with Timer("PolicyWorkerBase._forward_backward_micro__compute_loss"), gpu_memory_tracker("forward_backward_micro_compute_loss"):
                 policy_loss, loss_metrics = current_loss_fn(
                     action_log_probs,
                     old_action_log_probs,
@@ -894,23 +891,6 @@ class PolicyWorkerBase(Worker):
                     loss_mask=loss_mask,
                     rollout_logprobs=rollout_action_logprobs,
                 )
-
-        # Log memory before backward pass
-        mem_before_backward = log_gpu_memory("before_backward", level="info")
-        
-        def _log_memory_snapshot(label):
-            """Log detailed CUDA memory stats with rank info."""
-            try:
-                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-                stats = torch.cuda.memory_stats()
-                allocated = torch.cuda.memory_allocated() / 1024 / 1024
-                reserved = torch.cuda.memory_reserved() / 1024 / 1024
-                logger.info(f"[Rank {rank}][{label}] Allocated: {allocated:.2f}MB, Reserved: {reserved:.2f}MB, "
-                              f"Blocks allocated: {stats.get('allocated_bytes.all.allocated', 0)}")
-            except Exception as e:
-                logger.info(f"[{label}] Could not get memory stats: {e}")
-        
-        _log_memory_snapshot("BEFORE_backward")
         
         # SFT path: skip KL/entropy terms, return per-token outputs for Tinker API
         if resolved_loss_name == "cross_entropy":
@@ -918,8 +898,6 @@ class PolicyWorkerBase(Worker):
             loss = unscaled_loss * microbatch_weight
             self.strategy.backward(loss, self.model, self.optimizer)
             
-            _log_memory_snapshot("AFTER_backward_sft")
-
             # Compute elementwise loss for Tinker API (per-token NLL)
             with torch.no_grad():
                 elementwise_loss = -action_log_probs
@@ -992,16 +970,11 @@ class PolicyWorkerBase(Worker):
             loss = policy_loss * grad_sum_correction_factor + (kl_loss_term - entropy_loss_term) * microbatch_weight
             unscaled_loss = loss / grad_sum_correction_factor
             
-            _log_memory_snapshot("BEFORE_backward_strategy.backward")
             logger.info(f"About to call backward: loss={loss.item():.4f}, grad_sum_correction_factor={grad_sum_correction_factor}")
             
-            self.strategy.backward(loss, self.model, self.optimizer)
+            with gpu_memory_tracker("forward_backward_micro_backward"), Timer("forward_backward_micro_backward"):
+                self.strategy.backward(loss, self.model, self.optimizer)
             
-            _log_memory_snapshot("AFTER_backward_rl")
-            # Log memory after backward pass
-            log_gpu_memory_delta("backward_pass", mem_before_backward, level="info")
-            check_memory_pressure(threshold_pct=85.0)
-
             # Build per-sequence loss_fn_outputs with logprobs.
             batch_size = action_log_probs.shape[0]
             seq_len = action_log_probs.shape[1]
@@ -1013,7 +986,8 @@ class PolicyWorkerBase(Worker):
             else:
                 valid_lens = [seq_len] * batch_size
 
-            detached_log_probs = action_log_probs.detach().cpu()
+            with gpu_memory_tracker("detach_log_probs"):
+                detached_log_probs = action_log_probs.detach().cpu()
             loss_fn_outputs = []
             for i, valid_len in enumerate(valid_lens):
                 loss_fn_outputs.append(

@@ -402,6 +402,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             # Append eos when sampling_params.stop is not None. Does not affect 3.a as chat templates add eos_token.
             # sampling_params is not None for eval, but None for training (which uses engine.sampling_params which are from cfg)
             stop_strs = current_sampling_params.get("stop", None)
+            logger.info(f"stop strings: {stop_strs}")
             added_eos = False
             if (
                 stop_strs is not None

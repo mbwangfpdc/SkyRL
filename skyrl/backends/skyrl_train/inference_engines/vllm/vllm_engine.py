@@ -98,7 +98,7 @@ def setup_envvars_for_vllm(kwargs, bundle_indices):
     
     total_rank = kwargs.pop("total_rank", None)
     if total_rank is not None:
-        os.environ["SKYRL_ENGINE_IDX"] = str(total_rank)
+        os.environ["VLLM_ENGINE_IDX"] = str(total_rank)
 
 
 class BaseVLLMInferenceEngine(InferenceEngineInterface):

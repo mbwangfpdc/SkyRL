@@ -85,6 +85,46 @@ def time_func(msg: str):
     return decorator
 
 
+def gpu_memory_tracker(label: str, logger):
+    def to_mb(num_bytes: float) -> float:
+        """Convert bytes to megabytes."""
+        return float(num_bytes) / (1024.0 * 1024.0)
+    """Context manager that measures GPU memory delta and logs at exit."""
+    from contextlib import contextmanager
+    
+    @contextmanager
+    def _tracker():
+        if not torch.cuda.is_available():
+            yield
+            return
+        
+        # Record state before
+        device_idx = torch.cuda.current_device()
+        alloc_before = to_mb(torch.cuda.memory_allocated(device_idx))
+        reserved_before = to_mb(torch.cuda.memory_reserved(device_idx))
+        
+        try:
+            yield
+        finally:
+            # Record state after
+            alloc_after = to_mb(torch.cuda.memory_allocated(device_idx))
+            reserved_after = to_mb(torch.cuda.memory_reserved(device_idx))
+            
+            # Compute deltas
+            alloc_delta = alloc_after - alloc_before
+            reserved_delta = reserved_after - reserved_before
+            
+            # Print in format that matches log_gpu_memory style
+            import sys
+            logger.info(
+                f"[gpu_memory_delta] {label} | "
+                f"alloc: {alloc_delta:+.1f}MB ({alloc_before:.1f}→{alloc_after:.1f}MB) "
+                f"reserved: {reserved_delta:+.1f}MB ({reserved_before:.1f}→{reserved_after:.1f}MB)",
+                file=sys.stderr,
+            )
+    
+    return _tracker()
+
 def validate_batch_sizes(cfg: SkyRLTrainConfig):
     """
     Validate configured batch sizes.
@@ -742,6 +782,22 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
     return env_vars
 
 
+def _format_log_record(record) -> str:
+    """Render a loguru record using worker-bound fields when available."""
+    # TODO: the original extra fields are not populated because this was copied from the cais repo
+    extra = record["extra"]
+    extra["safe_pid"] = extra.get("pid", record["process"].id)
+    extra["safe_name"] = extra.get("orig_name", record["name"])
+    extra["safe_function"] = extra.get("orig_function", record["function"])
+    extra["safe_line"] = extra.get("orig_line", record["line"])
+    
+    return (
+        "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+        "<level>{level.name: <8}</level> | pid=<cyan>{extra[safe_pid]}</cyan> | "
+        "<cyan>{extra[safe_name]}</cyan>:<cyan>{extra[safe_function]}</cyan>:<cyan>{extra[safe_line]}</cyan> - "
+        "<level>{message}</level>\n"
+    )
+
 def configure_ray_worker_logging() -> None:
     """
     Configure logging for Ray workers.
@@ -765,10 +821,7 @@ def configure_ray_worker_logging() -> None:
         enqueue=True,
         backtrace=False,
         diagnose=False,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-        "<level>{level: <8}</level> | "
-        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
-        "<level>{message}</level>",
+        format=_format_log_record,
     )
 
     # 2) Route stdlib logging -> Loguru (so vLLM/transformers/etc. are formatted)

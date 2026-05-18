@@ -184,10 +184,7 @@ class FSDPStrategy(DistributedStrategy):
     @time_func("FSDPStrategy.backward")
     def backward(self, loss: torch.Tensor, model, optimizer: optim.Optimizer, **kwargs) -> None:
         """Perform backward pass"""
-        from skyrl.backends.skyrl_train.utils.memory_utils import log_gpu_memory
-        log_gpu_memory("strategy_backward_start")
         loss.backward()
-        log_gpu_memory("strategy_backward_end")
 
     @time_func("FSDPStrategy.optimizer_step")
     def optimizer_step(

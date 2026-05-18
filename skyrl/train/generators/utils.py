@@ -431,6 +431,8 @@ def prepare_generator_input(
         for repetition_id in range(n_samples_per_prompt):
             trajectory_ids.append(TrajectoryID(instance_id=uid, repetition_id=repetition_id))
             uids.append(uid)
+            
+    logger.info(f"Sampling params at prepare_generator_input: {sampling_params}")
 
     generator_input: GeneratorInput = {
         "prompts": all_prompts,

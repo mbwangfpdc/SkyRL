@@ -139,7 +139,7 @@ class ServerGroup:
     ) -> Any:
         """Create actor class with scheduling constraints for a specific bundle.
 
-        Also attach a runtime_env env var `SKYRL_ENGINE_IDX` so each actor
+        Also attach a runtime_env env var `VLLM_ENGINE_IDX` so each actor
         process receives a nondecreasing index (0..N-1).
         """
         logger.info(f"Assigning server {server_idx} to bundle index {start_bundle_idx} (logical GPU {server_idx * self._num_gpus_per_server})")
@@ -152,7 +152,7 @@ class ServerGroup:
                 placement_group_bundle_index=start_bundle_idx,
             ),
             runtime_env={
-                "env_vars": {"SKYRL_ENGINE_IDX": str(server_idx)}
+                "env_vars": {"VLLM_ENGINE_IDX": str(server_idx)}
             },
         )
 

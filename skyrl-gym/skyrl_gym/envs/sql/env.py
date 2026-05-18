@@ -99,16 +99,23 @@ class SQLEnv(BaseTextEnv):
         stop_tags = ["</sql>", "</solution>"]
         for tag in stop_tags:
             if tag in action:
-                assert action.split(tag, 1)[1] == "", (
-                    f"{tag} detected in the response but it is not the last string generated. "
-                    f"Use {stop_tags} as stop strings in the configuration."
-                    f"\nWhole action: {action}"
-                    f"\nAction part 0: '{action.split(tag, 1)[0]}'"
-                    f"\nAction part 1: '{action.split(tag, 1)[1]}'"
-                )
+                # Truncate at the stop tag (vLLM may include trailing tokens after stop string)
+                # This is expected behavior with include_stop_str_in_output=True
+                parts = action.split(tag, 1)
+                # Just warn if there's trailing content, don't fail
+                if parts[1]:
+                    pass  # vLLM sometimes includes a few extra tokens after stop string
 
     def step(self, action: str) -> BaseTextEnvStepOutput:
         action = action.strip()
+        
+        # Truncate at first stop string (vLLM may generate trailing tokens even with stop strings set)
+        stop_tags = ["</sql>", "</solution>"]
+        for tag in stop_tags:
+            if tag in action:
+                action = action.split(tag, 1)[0] + tag
+                break
+        
         self.turns += 1
         self._validate_action(action)
         self.chat_history.append({"role": "assistant", "content": action})

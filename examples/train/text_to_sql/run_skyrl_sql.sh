@@ -30,7 +30,7 @@ uv run --active --no-sync --extra fsdp -m skyrl.train.entrypoints.main_base \
   data.train_data="['$DATA_DIR/train.parquet']" \
   data.val_data="['$DATA_DIR/validation.parquet']" \
   trainer.policy.model.path=$MODEL \
-  trainer.epochs=5 \
+  trainer.epochs=1 \
   trainer.placement.colocate_all=true \
   trainer.strategy=fsdp2 \
   trainer.policy.fsdp_config.cpu_offload=false \
@@ -47,8 +47,8 @@ uv run --active --no-sync --extra fsdp -m skyrl.train.entrypoints.main_base \
   generator.inference_engine.tensor_parallel_size=$TP_SIZE \
   generator.inference_engine.data_parallel_size=$DP_SIZE \
   trainer.train_batch_size=$TRAIN_BATCH_SIZE \
-  trainer.micro_forward_batch_size_per_gpu=8 \
-  trainer.micro_train_batch_size_per_gpu=1 \
+  trainer.micro_forward_batch_size_per_gpu=4 \
+  trainer.micro_train_batch_size_per_gpu=2 \
   trainer.max_prompt_length=6000 \
   generator.max_input_length=$MAX_INPUT_LENGTH \
   generator.sampling_params.max_generate_length=$MAX_GENERATE_LENGTH \
@@ -65,7 +65,7 @@ uv run --active --no-sync --extra fsdp -m skyrl.train.entrypoints.main_base \
   generator.batched=false \
   environment.env_class=text2sql \
   generator.use_conversation_multi_turn=false \
-  generator.n_samples_per_prompt=5 \
+  generator.n_samples_per_prompt=6 \
   generator.inference_engine.gpu_memory_utilization=0.9 \
   generator.max_turns=6 \
   generator.sampling_params.temperature=0.6 \

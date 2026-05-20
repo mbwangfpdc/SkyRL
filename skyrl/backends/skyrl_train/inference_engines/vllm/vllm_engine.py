@@ -97,8 +97,6 @@ def setup_envvars_for_vllm(kwargs, bundle_indices):
     logger.info(f"{torch.cuda.is_available()=}, {torch.cuda.device_count()=}")
     
     total_rank = kwargs.pop("total_rank", None)
-    if total_rank is not None:
-        os.environ["VLLM_ENGINE_IDX"] = str(total_rank)
 
 
 class BaseVLLMInferenceEngine(InferenceEngineInterface):

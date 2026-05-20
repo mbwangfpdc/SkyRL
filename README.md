@@ -10,6 +10,20 @@
 
 ---
 
+# Run under profiling
+
+`./nsys.sh my_run_name /path/to/skyrl/run/script`
+
+e.g.
+
+`./nsys.sh sql_7b_4gpu_small ./examples/train/text_to_sql/run_skyrl_sql.sh`
+
+# Generate figures
+
+Insert the run name into the RUNS_TO_VIZ list in viz.ipynb then run the entire notebook.
+
+Note that currently the visualization is busted, and we should split out other scripts in order to enable visualizing different data.
+
 # Overview
 
 > [!IMPORTANT]

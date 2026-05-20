@@ -43,7 +43,7 @@ class Timer:
         #     from loguru import logger
         #     configure_ray_worker_logging(logger)
         #     self.logger = logger
-        self.logger.opt(depth=1).info(f"Started: '{self.message}'")
+        self.logger.opt(depth=1).debug(f"Started: '{self.message}'")
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -57,7 +57,7 @@ class Timer:
         #     from loguru import logger
         #     configure_ray_worker_logging(logger)
         #     self.logger = logger
-        self.logger.opt(depth=1).info(f"Started: '{self.message}'")
+        self.logger.opt(depth=1).debug(f"Started: '{self.message}'")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):

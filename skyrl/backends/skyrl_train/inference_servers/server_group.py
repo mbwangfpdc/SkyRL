@@ -152,7 +152,7 @@ class ServerGroup:
                 placement_group_bundle_index=start_bundle_idx,
             ),
             runtime_env={
-                "env_vars": {"VLLM_ENGINE_IDX": str(server_idx)}
+                "env_vars": {"VLLM_ENGINE_IDX": str(start_bundle_idx)}
             },
         )
 

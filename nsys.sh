@@ -32,14 +32,22 @@ export RAY_metrics_export_port=0
 # Optional: Silences Ray's internal logging for cleaner output
 export RAY_SCHEDULER_EVENTS=0
 
+# Make sure we have two arguments
+if [ "$#" -ne 2 ]; then
+    echo "Usage: $0 <run_id> <script_to_run>"
+    exit 1
+fi
+
 OUT_DIR=$ROOT_OUT_DIR/$1
 export CAIS_OUT_DIR=$OUT_DIR
-SCRIPT=$SKYRL_DIR/examples/train/text_to_sql/run_skyrl_sql_fast_debug_1gpu.sh
-SCRIPT=$SKYRL_DIR/examples/train/text_to_sql/run_skyrl_sql_fast_debug_3b_4gpu.sh
-SCRIPT=$SKYRL_DIR/examples/train/text_to_sql/run_skyrl_sql_fast_debug_7b_4gpu.sh
-SCRIPT=$SKYRL_DIR/examples/train/mini_swe_agent/run_mini_swe_8B.sh
-SCRIPT=$SKYRL_DIR/examples/train/mini_swe_agent/run_mini_swe_30B.sh
-SCRIPT=$SKYRL_DIR/examples/train/text_to_sql/run_skyrl_sql.sh
+# Take script as second argument
+SCRIPT=$2
+# SCRIPT=$SKYRL_DIR/examples/train/text_to_sql/run_skyrl_sql_fast_debug_1gpu.sh
+# SCRIPT=$SKYRL_DIR/examples/train/text_to_sql/run_skyrl_sql_fast_debug_3b_4gpu.sh
+# SCRIPT=$SKYRL_DIR/examples/train/text_to_sql/run_skyrl_sql_fast_debug_7b_4gpu.sh
+# SCRIPT=$SKYRL_DIR/examples/train/mini_swe_agent/run_mini_swe_8B.sh
+# SCRIPT=$SKYRL_DIR/examples/train/mini_swe_agent/run_mini_swe_30B.sh
+# SCRIPT=$SKYRL_DIR/examples/train/text_to_sql/run_skyrl_sql.sh
 # SCRIPT=$SKYRL_DIR/examples/train/gsm8k/run_gsm8k.sh
 
 rm -rf $OUT_DIR

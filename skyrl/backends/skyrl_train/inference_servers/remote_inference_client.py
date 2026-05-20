@@ -436,7 +436,7 @@ class RemoteInferenceClient:
             headers["X-Session-ID"] = str(session_id)
             headers["x-request-id"] = str(session_id)
 
-        logger.info(f"Making post call to {url} with headers: {headers}")
+        logger.debug(f"Making post call to {url} with headers: {headers}")
         response = await self._post(url, json=payload, headers=headers)
 
         choice = response["choices"][0]

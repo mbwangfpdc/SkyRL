@@ -4161,7 +4161,7 @@ wheels = [
 
 [[package]]
 name = "mini-swe-agent"
-source = { editable = "skyrl-train/skyrl_train/mini-swe-agent" }
+source = { editable = "third_party/mini-swe-agent" }
 dependencies = [
     { name = "jinja2" },
     { name = "litellm" },
@@ -8764,7 +8764,7 @@ requires-dist = [
     { name = "mamba-ssm", marker = "(python_full_version != '3.12.*' and sys_platform == 'linux' and extra == 'mamba') or (platform_machine != 'x86_64' and sys_platform == 'linux' and extra == 'mamba')", specifier = ">=2.3.0" },
     { name = "megatron-bridge", marker = "python_full_version >= '3.12' and sys_platform == 'linux' and extra == 'megatron'", git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge?rev=420a7da37afea5eb4e8d3899d540c830b9c4cda2" },
     { name = "megatron-core", marker = "python_full_version >= '3.12' and sys_platform == 'linux' and extra == 'megatron'", git = "https://github.com/NVIDIA/Megatron-LM?rev=4ef64ebc468cd3da41a22d46a2db37163694e8e2" },
-    { name = "mini-swe-agent", marker = "extra == 'miniswe'", editable = "skyrl-train/skyrl_train/mini-swe-agent" },
+    { name = "mini-swe-agent", marker = "extra == 'miniswe'", editable = "third_party/mini-swe-agent" },
     { name = "mkdocs", marker = "extra == 'dev'" },
     { name = "mkdocs-material", marker = "extra == 'dev'" },
     { name = "mkdocstrings", extras = ["python"], marker = "extra == 'dev'", specifier = ">=0.24.0" },
@@ -8819,8 +8819,8 @@ requires-dist = [
     { name = "ty", marker = "extra == 'dev'" },
     { name = "typer", specifier = ">=0.17.4" },
     { name = "uvicorn", marker = "extra == 'skyrl-train'" },
-    { name = "vllm", marker = "sys_platform == 'linux' and extra == 'fsdp'", editable = "skyrl-train/skyrl_train/vllm" },
-    { name = "vllm", marker = "sys_platform == 'linux' and extra == 'megatron'", editable = "skyrl-train/skyrl_train/vllm" },
+    { name = "vllm", marker = "sys_platform == 'linux' and extra == 'fsdp'", editable = "third_party/vllm" },
+    { name = "vllm", marker = "sys_platform == 'linux' and extra == 'megatron'", editable = "third_party/vllm" },
     { name = "vllm-router", marker = "sys_platform == 'linux' and extra == 'fsdp'" },
     { name = "vllm-router", marker = "sys_platform == 'linux' and extra == 'megatron'" },
     { name = "vllm-router", marker = "sys_platform == 'linux' and extra == 'skyrl-train'" },
@@ -10107,7 +10107,7 @@ wheels = [
 
 [[package]]
 name = "vllm"
-source = { editable = "skyrl-train/skyrl_train/vllm" }
+source = { editable = "third_party/vllm" }
 dependencies = [
     { name = "aiohttp", marker = "(sys_platform == 'linux' and extra == 'extra-5-skyrl-fsdp') or (sys_platform == 'linux' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-jax') or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-jax' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-fsdp') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-gpu') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-jax') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-miniswe' and extra == 'extra-5-skyrl-tpu')" },
     { name = "anthropic", marker = "(sys_platform == 'linux' and extra == 'extra-5-skyrl-fsdp') or (sys_platform == 'linux' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-jax') or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-jax' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-fsdp') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-gpu') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-jax') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-miniswe' and extra == 'extra-5-skyrl-tpu')" },

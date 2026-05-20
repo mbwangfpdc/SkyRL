@@ -359,6 +359,7 @@ class SkyRLGymGenerator(GeneratorInterface):
 
             # 1. Generate output
             if is_step_wise or retokenize_chat_history:
+                # logger.info(f"Retokenizing chat history for session {session_id} at step {step} since {'step-wise training is enabled' if is_step_wise else 'custom chat template is used'}")
                 # re-apply whole chat template so length check is correct
                 agent_loop_state.input_ids = self.tokenizer.apply_chat_template(
                     chat_history,
@@ -381,7 +382,11 @@ class SkyRLGymGenerator(GeneratorInterface):
             logger.info(f"{session_id}:{step} took {time.time() - generate_start:.2f}s")
             log["prompts"].append(prompt)
             if session_id == "0_0":
-                logger.info(f"Debug log for session {session_id}, step {step}: prompt: {prompt}, engine_output: {engine_output}")
+                if step == 1:
+                    logger.info(f"Initial prompt for session {session_id} is: {prompt}")
+                input_string = self.tokenizer.decode(agent_loop_state.input_ids)
+                logger.info(f"engine_input: {input_string}")
+                logger.info(f"engine_output: {engine_output}")
             output = engine_output["responses"][0]
             log["responses"].append(output)
             output_ids = engine_output["response_ids"][0]
@@ -402,7 +407,6 @@ class SkyRLGymGenerator(GeneratorInterface):
             # Append eos when sampling_params.stop is not None. Does not affect 3.a as chat templates add eos_token.
             # sampling_params is not None for eval, but None for training (which uses engine.sampling_params which are from cfg)
             stop_strs = current_sampling_params.get("stop", None)
-            logger.info(f"stop strings: {stop_strs}")
             added_eos = False
             if (
                 stop_strs is not None

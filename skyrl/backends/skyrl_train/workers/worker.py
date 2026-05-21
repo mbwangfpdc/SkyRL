@@ -35,20 +35,8 @@ from skyrl.backends.skyrl_train.distributed.ulysses import (
     apply_monkey_patch,
     set_ulysses_sequence_parallel_group,
 )
-# <<<<<<< /local_ssd1/mborjigi/skyrl/SkyRL/skyrl/backends/skyrl_train/workers/worker.py
 from skyrl.backends.skyrl_train.inference_engines.inference_engine_client import (
     InferenceEngineClient,
-# =======
-# from skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
-# from skyrl_train.env_vars import _SKYRL_USE_NEW_INFERENCE
-# from skyrl_train.training_batch import TrainingInputBatch, TrainingOutputBatch, tensor_to_strings
-# from skyrl_train.utils import (
-#     Timer,
-#     time_func,
-#     get_ray_pg_ready_with_timeout,
-#     get_reordered_bundle_indices,
-#     ray_noset_visible_devices,
-# >>>>>>> /local_ssd1/mborjigi/skyrl/SkyRL/skyrl/backends/skyrl_train/workers/OLD_worker.py
 )
 from skyrl.backends.skyrl_train.training_batch import (
     TrainingInputBatch,

@@ -165,12 +165,16 @@ class BasePPOExp:
         Returns:
             PromptDataset: The training dataset.
         """
+        if self.cfg.trainer.max_rl_iterations > 0:
+            max_dataset_size = self.cfg.trainer.max_rl_iterations * self.cfg.trainer.train_batch_size
+        else:
+            max_dataset_size = None
         prompts_dataset = PromptDataset(
             datasets=self.cfg.data.train_data,
             tokenizer=self.tokenizer,
             max_prompt_length=self.cfg.trainer.max_prompt_length,
             num_workers=8,
-            batch_size=self.cfg.trainer.train_batch_size,
+            max_dataset_size=max_dataset_size,
         )
         # make sure the dataset is large enough to train on
         assert (

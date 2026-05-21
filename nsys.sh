@@ -1,7 +1,7 @@
 #!/bin/zsh
 
 SKYRL_DIR=$(dirname $(realpath $0))
-ROOT_OUT_DIR=/local_nvme1/mborjigi/output
+ROOT_OUT_DIR=$SKYRL_DIR/profile/output
 
 source $SKYRL_DIR/.venv/bin/activate
 
@@ -9,7 +9,6 @@ source $SKYRL_DIR/.venv/bin/activate
 # we think of as gpus 0,1,2,3 are in fact 1,0,3,2 to nsys. Find out by calling sudo nsys profile --gpu-metrics-devices=help and comparing it to nvidia-smi. terrible.
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 # export CUDA_LAUNCH_BLOCKING=1
-export TMPDIR=/local_nvme1/mborjigi/tmp
 export DEEPSPEED_TIMEOUT=60
 export RAY_NCCL_TIMEOUT=120
 export NCCL_TIMEOUT=120
@@ -31,6 +30,8 @@ export RAY_INCLUDE_DASHBOARD=0
 export RAY_metrics_export_port=0
 # Optional: Silences Ray's internal logging for cleaner output
 export RAY_SCHEDULER_EVENTS=0
+export SKYRL_PROFILE_OUT_DIR=$ROOT_OUT_DIR
+export SKYRL_TMPDIR=/local_nvme1/tmp
 
 # Make sure we have two arguments
 if [ "$#" -ne 2 ]; then

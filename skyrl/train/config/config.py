@@ -612,6 +612,8 @@ class TrainerConfig(BaseConfig):
     update_epochs_per_batch: int = 1
     """Number of gradient update passes over each training batch."""
     train_batch_size: int = 1024
+    """Number of inference->reward->train cycles to perform at most total. This is implemented by truncating the data loader to yield at most ``train_batch_size * max_rl_iterations`` samples. Set ``-1`` to disable."""
+    max_rl_iterations: int = 3
     """See ``utils/utils.py::validate_batch_sizes`` for train, mini, and micro batch size constraints."""
     policy_mini_batch_size: int = 256
     critic_mini_batch_size: int = 256

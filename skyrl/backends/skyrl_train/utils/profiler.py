@@ -120,7 +120,7 @@ def profile(
     
     Args:
         profile_name: Name of the profile run. Filename generated using this
-                    Profiles will be saved to /local_nvme1/mborjigi/output/{profile_name}_{run_index}.json
+                    Profiles will be saved to $SKYRL_PROFILE_OUT_DIR/{profile_name}_{run_index}.json
         activities: List of profiler activities to capture. 
                    Defaults to [ProfilerActivity.CPU, ProfilerActivity.CUDA] if CUDA is available.
         record_shapes: If True, records tensor shapes.
@@ -152,7 +152,7 @@ def profile(
         ```
     """
     torch_rank = torch.distributed.get_rank()
-    output_path = f"/local_nvme1/mborjigi/output/{profile_name}_{PROFILE_INDEX_MAP[profile_name]}.json.{torch_rank}"
+    output_path = os.path.join(os.getenv('SKYRL_PROFILE_OUT_DIR'), f"{profile_name}_{PROFILE_INDEX_MAP[profile_name]}.json.{torch_rank}")
     PROFILE_INDEX_MAP[profile_name] += 1
     import psutil
     logger.info(f"Profiling process {psutil.Process(os.getpid()).name()} (PID: {os.getpid()})")

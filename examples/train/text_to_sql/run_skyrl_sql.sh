@@ -46,6 +46,7 @@ uv run --active --no-sync --extra fsdp -m skyrl.train.entrypoints.main_base \
   generator.inference_engine.num_engines=$NUM_INFERENCE_ENGINES \
   generator.inference_engine.tensor_parallel_size=$TP_SIZE \
   generator.inference_engine.data_parallel_size=$DP_SIZE \
+  trainer.max_rl_iterations=2 \
   trainer.train_batch_size=$TRAIN_BATCH_SIZE \
   trainer.micro_forward_batch_size_per_gpu=4 \
   trainer.micro_train_batch_size_per_gpu=2 \

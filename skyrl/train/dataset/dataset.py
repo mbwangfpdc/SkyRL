@@ -22,14 +22,14 @@ class PromptDataset:
         num_workers: int = 8,
         prompt_key: str = "prompt",
         env_class_key: str = "env_class",
-        batch_size: int = None,
+        max_dataset_size: int = None,
     ):
         self.tokenizer = tokenizer
         self.max_prompt_length = max_prompt_length
         self.prompt_key = prompt_key
         self.env_class_key = env_class_key
         self.num_workers = num_workers
-        self.batch_size = batch_size
+        self.max_dataset_size = max_dataset_size
 
         self.datasets = datasets
         if isinstance(self.datasets, str):
@@ -85,11 +85,9 @@ class PromptDataset:
 
         logger.info(f"Filtered dataset size: {len(self.dataframe)}")
 
-        assert self.batch_size is not None
-        MAX_BATCHES = 1
-        if len(self.dataframe) > self.batch_size * MAX_BATCHES:
-            logger.info(f"Sampling {MAX_BATCHES} batches for faster iteration during development.")
-            self.dataframe = self.dataframe.select(range(0, self.batch_size * MAX_BATCHES))
+        if self.max_dataset_size is not None and len(self.dataframe) > self.max_dataset_size:
+            logger.info(f"Sampling for faster iteration during development.")
+            self.dataframe = self.dataframe.shuffle(seed=42).select(range(self.max_dataset_size))
             logger.info(f"Filtered dataset size: {len(self.dataframe)}")
     def __getitem__(self, item):
         row_dict: dict = self.dataframe[item]

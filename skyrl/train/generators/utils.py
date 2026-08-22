@@ -544,12 +544,20 @@ def prepare_generator_input(
     # Create TrajectoryID objects - one UID per row, repetition_id for multiple samples
     trajectory_ids = []
     uids = []
-    for _, prompt in enumerate(prompts):
+    for sample_index, prompt in enumerate(prompts):
         uid: str = prompt["uid"]
 
         # Create TrajectoryID for each repetition
         for repetition_id in range(n_samples_per_prompt):
-            trajectory_ids.append(TrajectoryID(instance_id=uid, repetition_id=repetition_id))
+            trajectory_ids.append(
+                TrajectoryID(
+                    instance_id=uid,
+                    repetition_id=repetition_id,
+                    step=global_step,
+                    sample_index=sample_index,
+                    phase=training_phase,
+                )
+            )
             uids.append(uid)
 
     generator_input: GeneratorInput = {

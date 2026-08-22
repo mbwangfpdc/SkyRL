@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import socket
+import time
 from collections import defaultdict
 from contextlib import contextmanager
 from ctypes import CDLL, POINTER, Structure, c_char_p, c_int, c_ulong, c_void_p
@@ -779,6 +780,37 @@ class PolicyWorkerBase(Worker):
         self.record_memory: bool = False
         self.mesh_rank: MeshRank = None
         self.policy_loss_fn: Callable = PolicyLossRegistry.get(self.cfg.algorithm.policy_loss_type)
+        # --- perf breakdown instrumentation (diagnostic) ---
+        self._perf_bwd_call_count = 0
+
+    def _maybe_profiled_backward(self, loss: torch.Tensor) -> None:
+        """Run self.strategy.backward, optionally wrapped in torch.profiler to break
+        down which ops inside the backward pass dominate. Diagnostic only: gated by
+        SKYRL_PROFILE_BWD=1 so it costs nothing (and doesn't perturb steady-state
+        timing) unless explicitly enabled. Sampled every SKYRL_PROFILE_BWD_EVERY_N
+        calls (default 50), and only on global rank 0, to keep overhead/log volume down.
+        """
+        self._perf_bwd_call_count += 1
+        profile_enabled = os.environ.get("SKYRL_PROFILE_BWD", "0") == "1"
+        every_n = int(os.environ.get("SKYRL_PROFILE_BWD_EVERY_N", "50"))
+        is_rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+        should_profile = profile_enabled and is_rank0 and (self._perf_bwd_call_count % every_n == 1)
+
+        if not should_profile:
+            self.strategy.backward(loss, self.model, self.optimizer)
+            return
+
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            record_shapes=False,
+            with_stack=False,
+        ) as prof:
+            self.strategy.backward(loss, self.model, self.optimizer)
+
+        table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=20)
+        logger.opt(depth=1).info(
+            f"[perf-breakdown] backward op profile (call #{self._perf_bwd_call_count}):\n{table}"
+        )
 
     def forward_backward(
         self,
@@ -815,16 +847,26 @@ class PolicyWorkerBase(Worker):
         all_metrics = defaultdict(list)
         all_loss_fn_outputs = []  # Handle separately from scalar metrics
 
+        # --- perf breakdown instrumentation (diagnostic; not part of the metrics pipeline) ---
+        _perf_totals = defaultdict(float)
+        _perf_per_micro = []
+        _fb_wall_start = time.time()
+
         for microbatch in microbatch_iterator:
             experience = BaseBatchIterator.batch_to_experience(microbatch)
             microbatch_weight = len(microbatch) / len(data)
+            _micro_perf = {}
             metrics = self._forward_backward_micro(
                 experience,
                 microbatch_weight,
                 loss_fn=loss_fn,
                 loss_fn_config=loss_fn_config,
                 return_per_token_outputs=return_per_token_outputs,
+                _perf=_micro_perf,
             )
+            for k, v in _micro_perf.items():
+                _perf_totals[k] += v
+            _perf_per_micro.append(_micro_perf)
 
             # Extract loss_fn_outputs before reduce_metrics (it's not a scalar metric)
             if "loss_fn_outputs" in metrics:
@@ -832,6 +874,28 @@ class PolicyWorkerBase(Worker):
 
             for k, v in metrics.items():
                 all_metrics[k].append(v)
+
+        _fb_wall = time.time() - _fb_wall_start
+        if _perf_per_micro:
+            n = len(_perf_per_micro)
+            _bwd_times = [m.get("bwd", 0.0) for m in _perf_per_micro]
+            logger.opt(depth=1).info(
+                "[perf-breakdown] forward_backward: wall={wall:.2f}s over {n} microbatches | "
+                "fwd_total={fwd:.2f}s loss_total={loss:.2f}s kl_entropy_total={kl:.2f}s "
+                "bwd_total={bwd:.2f}s unaccounted={other:.2f}s | "
+                "bwd_per_micro min={bwd_min:.3f}s max={bwd_max:.3f}s mean={bwd_mean:.3f}s".format(
+                    wall=_fb_wall,
+                    n=n,
+                    fwd=_perf_totals.get("fwd", 0.0),
+                    loss=_perf_totals.get("loss_fn", 0.0),
+                    kl=_perf_totals.get("kl_entropy", 0.0),
+                    bwd=_perf_totals.get("bwd", 0.0),
+                    other=_fb_wall - sum(_perf_totals.values()),
+                    bwd_min=min(_bwd_times),
+                    bwd_max=max(_bwd_times),
+                    bwd_mean=sum(_bwd_times) / n,
+                )
+            )
 
         # Reduce across microbatches and all-reduce metrics across DP ranks.
         # Loss metrics are pre-scaled sums, so keep the same sum-reduction
@@ -858,6 +922,7 @@ class PolicyWorkerBase(Worker):
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
         return_per_token_outputs: bool = True,
+        _perf: Optional[Dict[str, float]] = None,
     ) -> Dict[str, float]:
         """
         Perform forward and backward pass for one micro batch.
@@ -912,6 +977,9 @@ class PolicyWorkerBase(Worker):
             loss_config = type(loss_config).from_dict_config(new_loss_config)
 
         # TODO (sumanthrh): don't think this does anything for fsdp rn because autocast happens internally
+        if _perf is not None:
+            torch.cuda.synchronize()
+            _t0 = time.time()
         with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             # actor loss
             action_log_probs, output = self.model(
@@ -925,6 +993,10 @@ class PolicyWorkerBase(Worker):
                 pixel_values=experience.pixel_values,
                 image_grid_thw=experience.image_grid_thw,
             )
+            if _perf is not None:
+                torch.cuda.synchronize()
+                _t1 = time.time()
+                _perf["fwd"] = _perf.get("fwd", 0.0) + (_t1 - _t0)
             # loss function
             # TODO: recompute advantages
             policy_loss, loss_metrics = current_loss_fn(
@@ -935,6 +1007,10 @@ class PolicyWorkerBase(Worker):
                 loss_mask=loss_mask,
                 rollout_logprobs=rollout_action_logprobs,
             )
+            if _perf is not None:
+                torch.cuda.synchronize()
+                _t2 = time.time()
+                _perf["loss_fn"] = _perf.get("loss_fn", 0.0) + (_t2 - _t1)
 
         # SFT path: skip KL/entropy terms, return per-token outputs for Tinker API
         if resolved_loss_name == "cross_entropy":
@@ -945,7 +1021,13 @@ class PolicyWorkerBase(Worker):
             grad_sum_correction_factor = self.mesh_rank.dp_size
             loss = policy_loss * grad_sum_correction_factor
             unscaled_loss = policy_loss
-            self.strategy.backward(loss, self.model, self.optimizer)
+            if _perf is not None:
+                torch.cuda.synchronize()
+                _t_bwd0 = time.time()
+            self._maybe_profiled_backward(loss)
+            if _perf is not None:
+                torch.cuda.synchronize()
+                _perf["bwd"] = _perf.get("bwd", 0.0) + (time.time() - _t_bwd0)
 
             # Only build per-token outputs for callers that consume them.
             if return_per_token_outputs:
@@ -995,6 +1077,9 @@ class PolicyWorkerBase(Worker):
             }
         else:
             # RL path: add optional KL/entropy terms
+            if _perf is not None:
+                torch.cuda.synchronize()
+                _t_kl0 = time.time()
             # entropy loss
             with torch.set_grad_enabled(self.cfg.algorithm.use_entropy_loss):
                 # batch_size, seqlen
@@ -1019,6 +1104,9 @@ class PolicyWorkerBase(Worker):
             else:
                 kl_loss = torch.tensor(0.0)
             kl_loss_term = kl_loss * self.cfg.algorithm.kl_loss_coef
+            if _perf is not None:
+                torch.cuda.synchronize()
+                _perf["kl_entropy"] = _perf.get("kl_entropy", 0.0) + (time.time() - _t_kl0)
 
             # DP all-reduce averages gradients, but policy losses are pre-scaled sums
             # (see `apply_loss_reduction_to_advantages_minibatch`), so we multiply by
@@ -1029,7 +1117,13 @@ class PolicyWorkerBase(Worker):
             # so we just average them across microbatches and DP workers.
             loss = policy_loss * grad_sum_correction_factor + (kl_loss_term - entropy_loss_term) * microbatch_weight
             unscaled_loss = loss / grad_sum_correction_factor
-            self.strategy.backward(loss, self.model, self.optimizer)
+            if _perf is not None:
+                torch.cuda.synchronize()
+                _t_bwd0 = time.time()
+            self._maybe_profiled_backward(loss)
+            if _perf is not None:
+                torch.cuda.synchronize()
+                _perf["bwd"] = _perf.get("bwd", 0.0) + (time.time() - _t_bwd0)
 
             # Build per-sequence loss_fn_outputs with logprobs.
             batch_size = action_log_probs.shape[0]

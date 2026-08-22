@@ -145,6 +145,7 @@ class SkyRLGymGenerator(GeneratorInterface):
         inference_engine_client: InferenceEngineInterface,
         tokenizer,
         policy_model_name: Optional[str] = None,
+        trace_recorder=None,
     ):
         """
         Args:
@@ -156,12 +157,18 @@ class SkyRLGymGenerator(GeneratorInterface):
                 into every ``client.generate(...)`` call as ``model``. When
                 ``None`` (default), the client falls back to its own
                 ``model_name``
+            trace_recorder: optional trace_record.TraceRecorder (see that module). When set,
+                every TRAIN trajectory's turn-by-turn shape (decode lengths, observation
+                lengths, env service times) is appended to its trace file in
+                granular-cais-rl's replay-compatible schema. None (default) is a strict
+                no-op on the rollout path.
         """
         self.generator_cfg = generator_cfg
         self.skyrl_gym_cfg = skyrl_gym_cfg
         self.inference_engine_client = inference_engine_client
         self.tokenizer = tokenizer
         self.policy_model_name = policy_model_name
+        self.trace_recorder = trace_recorder
         self.max_turns = generator_cfg.max_turns
         self.batched = generator_cfg.batched
         self.use_conversation_multi_turn = generator_cfg.use_conversation_multi_turn
@@ -229,6 +236,24 @@ class SkyRLGymGenerator(GeneratorInterface):
             return await loop.run_in_executor(executor, func, *args, **kwargs)
         else:
             return func(*args, **kwargs)
+
+    async def _run_env_call_timed(self, func, *args):
+        """Run an env call, returning (result, service_s) where service_s is measured INSIDE
+        the submitted callable -- i.e. excluding time spent waiting for a free
+        ``max_env_workers`` thread. Used only for trace recording: replaying a recorded
+        duration that included queue wait would bake this run's scheduling into a replay
+        that has its own (see granular-cais-rl's replay.py for the fuller rationale)."""
+        holder = {}
+
+        def _call(*a):
+            t0 = time.monotonic()
+            try:
+                return func(*a)
+            finally:
+                holder["s"] = time.monotonic() - t0
+
+        result = await self._run_in_executor_if_available(_call, *args)
+        return result, holder.get("s", 0.0)
 
     # ------------------------------------------------------------------
     # Subclass hooks. Default implementations are no-ops so generic envs
@@ -323,6 +348,22 @@ class SkyRLGymGenerator(GeneratorInterface):
         session_id = (
             f"{trajectory_id.instance_id}_{trajectory_id.repetition_id}" if trajectory_id is not None else uuid4().hex
         )
+        # Deterministic-replay trace recording (trace_record.py). Only TRAIN trajectories are
+        # recorded: eval is a different workload and would collide with the training batch's
+        # (step, trace_session_id) keyspace. trace_session_id addresses the trajectory by its
+        # stable dataset-row identity (instance_id), same as `session_id` above -- a
+        # granular-side replay run reads its own batch composition directly out of the trace by
+        # this identity, rather than reconstructing it from its own (possibly differently-
+        # shuffled) dataset iteration, so this key does not need to encode a batch position.
+        recording = (
+            self.trace_recorder is not None
+            and trajectory_id is not None
+            and (trajectory_id.phase is None or trajectory_id.phase == "train")
+            and trajectory_id.step is not None
+        )
+        trace_session_id = session_id if recording else None
+        turn_records: List[dict] = []
+        env_init_service_s = 0.0
         try:
             # NOTE: `custom_chat_template` was mainly for getting accurate loss masks for thinking models.
             # This is no longer needed now given that step wise training is supported
@@ -341,7 +382,10 @@ class SkyRLGymGenerator(GeneratorInterface):
             chat_history = copy.deepcopy(prompt)
 
             # init() returns the first prompt to be given to the model, and optional metadata dict
-            chat_history, _ = await self._run_in_executor_if_available(env.init, chat_history)
+            if recording:
+                (chat_history, _), env_init_service_s = await self._run_env_call_timed(env.init, chat_history)
+            else:
+                chat_history, _ = await self._run_in_executor_if_available(env.init, chat_history)
             initial_chat_history_length = len(chat_history)
             initial_input_ids = self.tokenizer.apply_chat_template(
                 chat_history,
@@ -444,7 +488,10 @@ class SkyRLGymGenerator(GeneratorInterface):
 
                 # 2. Environment step
                 env_step_start_time = time.monotonic()
-                env_step_output: BaseTextEnvStepOutput = await self._run_in_executor_if_available(env.step, output)
+                if recording:
+                    env_step_output, env_step_service_s = await self._run_env_call_timed(env.step, output)
+                else:
+                    env_step_output = await self._run_in_executor_if_available(env.step, output)
                 time_splits["env"] += time.monotonic() - env_step_start_time
                 new_obs = env_step_output["observations"]
                 step_reward: float = env_step_output["reward"]
@@ -461,6 +508,18 @@ class SkyRLGymGenerator(GeneratorInterface):
                     output_ids = self.tokenizer.encode(output, add_special_tokens=False)
 
                 obs_ids = self.get_obs_ids_from_obs(new_obs, agent_loop_state.done)
+
+                if recording:
+                    turn_records.append({
+                        "gen_tokens": len(output_ids),
+                        "obs_tokens": len(obs_ids),
+                        "env_step_service_s": round(env_step_service_s, 6),
+                        "reward": float(step_reward),
+                        "done": bool(agent_loop_state.done),
+                        "finish_reason": stop_reason,
+                        # Real content, not just a length -- see trace_record.py.
+                        "obs_messages": list(new_obs),
+                    })
 
                 # final turn output containing generated response and environment observations
                 turn_output = TurnOutput(
@@ -600,6 +659,24 @@ class SkyRLGymGenerator(GeneratorInterface):
             )
             agent_loop_output.e2e_time = time.monotonic() - agent_loop_start_time
             agent_loop_output.time_splits = time_splits
+
+            if recording and turn_records and response_ids is not None:
+                from skyrl.train.generators.trace_record import TrajectoryTrace, TurnTrace
+
+                total_reward = sum(r for r, _ in per_step_rewards)
+                self.trace_recorder.write(TrajectoryTrace(
+                    step=trajectory_id.step if trajectory_id.step is not None else -1,
+                    mb=0,
+                    session_id=trace_session_id,
+                    sample_id=int(trajectory_id.instance_id),
+                    prompt_tokens=initial_prompt_length,
+                    env_init_service_s=round(env_init_service_s, 6),
+                    turns=[TurnTrace(**t) for t in turn_records],
+                    reward=float(total_reward),
+                    stop_reason=stop_reason,
+                    response_tokens=len(response_ids),
+                ))
+
             return agent_loop_output
 
         finally:

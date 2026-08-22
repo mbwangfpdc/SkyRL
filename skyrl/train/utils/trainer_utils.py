@@ -849,10 +849,18 @@ def build_dataloader(
     num_workers = cfg.data.dataloader.num_workers
     assert num_workers is not None, "dataloader `num_workers` should be non-null"
 
+    # Deterministic-replay trace recording (trace_record.py) keys trajectories by their
+    # stable dataset-row identity (instance_id), not a batch position, so unlike an earlier
+    # version of this feature, recording does NOT need shuffling disabled: a granular-side
+    # replay run reads its own batch composition directly out of the trace by that identity
+    # rather than reconstructing it from an independent (and possibly differently-shuffled)
+    # dataloader iteration.
+    shuffle = True if is_train else False
+
     dataloader = StatefulDataLoader(
         dataset,
         batch_size=batch_size if not is_fully_async else 1,
-        shuffle=True if is_train else False,
+        shuffle=shuffle,
         collate_fn=dataset.collate_fn,
         num_workers=num_workers,
         # Unlike `shuffle`/`drop_last`, not branched on `is_train`: both dataloaders are

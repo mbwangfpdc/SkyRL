@@ -43,8 +43,11 @@ class SkyRLVLMGymGenerator(SkyRLGymGenerator):
         inference_engine_client: RemoteInferenceClient,
         tokenizer,
         policy_model_name: Optional[str] = None,
+        trace_recorder=None,
     ):
-        super().__init__(generator_cfg, skyrl_gym_cfg, inference_engine_client, tokenizer, policy_model_name)
+        super().__init__(
+            generator_cfg, skyrl_gym_cfg, inference_engine_client, tokenizer, policy_model_name, trace_recorder
+        )
         logger.info("Initialized SkyRLVLMGymGenerator (VLM multi-modal generator)")
 
     def _validate_cfg(self, generator_cfg: GeneratorConfig):

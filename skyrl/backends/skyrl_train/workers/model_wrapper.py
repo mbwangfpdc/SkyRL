@@ -3,10 +3,13 @@
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/models/actor.py
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/models/model.py
 
+import os
+import time
 from typing import Optional, Union
 
 import numpy as np
 import torch
+import torch.distributed
 import torch.nn as nn
 import transformers
 from flash_attn.bert_padding import pad_input, unpad_input
@@ -87,6 +90,8 @@ class HFModelWrapper(nn.Module):
         self.attn_implementation = "flash_attention_2" if use_flash_attention_2 else "sdpa"
         self.remove_microbatch_padding = remove_microbatch_padding
         self.is_vlm = False
+        # --- perf breakdown instrumentation (diagnostic) ---
+        self._perf_fwd_call_count = 0
         if remove_microbatch_padding:
             assert (
                 self.attn_implementation == "flash_attention_2"
@@ -252,6 +257,23 @@ class HFModelWrapper(nn.Module):
         mm_token_type_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Returns action log probs"""
+        self._perf_fwd_call_count += 1
+        _profile_enabled = os.environ.get("SKYRL_PROFILE_FWD", "0") == "1"
+        _every_n = int(os.environ.get("SKYRL_PROFILE_FWD_EVERY_N", "50"))
+        _is_rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+        _should_profile = _profile_enabled and _is_rank0 and (self._perf_fwd_call_count % _every_n == 1)
+        _perf_fwd: Optional[dict] = {} if _should_profile else None
+
+        def _mark(key: str, _state={"t": None}):
+            """Diagnostic-only sub-timer; no-op unless _should_profile."""
+            if _perf_fwd is None:
+                return
+            torch.cuda.synchronize()
+            now = time.time()
+            if _state["t"] is not None:
+                _perf_fwd[key] = _perf_fwd.get(key, 0.0) + (now - _state["t"])
+            _state["t"] = now
+
         has_image_inputs = pixel_values is not None or image_grid_thw is not None
         if self.is_vlm:
             # VLMs use model specific 3D positional IDs, meaning sequence packing can not be supported.
@@ -272,6 +294,7 @@ class HFModelWrapper(nn.Module):
         position_ids = attention_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 1)
 
+        _mark("prep")  # position_ids / VLM prep above
         sequences_fwd = sequences
         position_ids_fwd = position_ids
         attention_mask_fwd = attention_mask
@@ -287,6 +310,7 @@ class HFModelWrapper(nn.Module):
                 # (nnz, 1) -> (1, nnz)
                 position_ids_fwd = position_ids_fwd.transpose(0, 1)
                 attention_mask_fwd = None  # no attention mask with FA 2
+        _mark("unpad")
 
         sequences_rolled = torch.roll(sequences_fwd, shifts=-1, dims=1)
         if self.sequence_parallel_size > 1:
@@ -329,6 +353,7 @@ class HFModelWrapper(nn.Module):
             output = self.model(sequences_fwd, attention_mask=None, position_ids=position_ids_fwd)
         else:
             output = self.model(sequences_fwd, attention_mask=attention_mask_fwd, position_ids=position_ids_fwd)
+        _mark("hf_model_fwd")
 
         logits_BSV = output["logits"]
         logits_BSV.div_(temperature)
@@ -339,6 +364,7 @@ class HFModelWrapper(nn.Module):
             sequences_rolled,
             inplace_backward=True,
         )
+        _mark("logprobs_from_logits")
 
         # gather output if sp > 1
         if self.sequence_parallel_size > 1:
@@ -354,6 +380,7 @@ class HFModelWrapper(nn.Module):
             log_probs = pad_input(
                 log_probs.transpose(0, 1), indices=nnz_indices, batch=batch_size, seqlen=seqlen
             ).squeeze(-1)
+        _mark("repad_logprobs")
 
         if compute_entropy:
             # For sample packing: entropy is calculated on unpacked data, so no attention mask needed
@@ -384,6 +411,13 @@ class HFModelWrapper(nn.Module):
                 )  # (1, nnz) -> (B, S)
 
             output["entropy"] = entropy_BS
+        _mark("entropy")
+
+        if _perf_fwd:
+            logger.opt(depth=1).info(
+                f"[perf-breakdown] model_wrapper.forward (call #{self._perf_fwd_call_count}): "
+                + " ".join(f"{k}={v:.4f}s" for k, v in _perf_fwd.items())
+            )
 
         if isinstance(num_actions, list):
             if len(num_actions) == 1:

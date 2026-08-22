@@ -14,6 +14,15 @@ TrainingPhase = Literal["train", "eval"]
 class TrajectoryID:
     instance_id: str  # Unique identifier for the instance in the dataset
     repetition_id: int  # Which sample/repetition for this UID (0, 1, 2... for GRPO)
+    # Deterministic-replay bookkeeping (see skyrl.train.generators.trace_record). All three
+    # are None outside a trace-recording run. The trace itself addresses trajectories by
+    # (step, f"{instance_id}_{repetition_id}") -- instance_id is the dataset-wide UID above,
+    # not sample_index. sample_index (this prompt's position within this step's batch,
+    # 0..batch_size-1) is unused by trace addressing; kept for now as a position record but
+    # not load-bearing for replay.
+    step: Optional[int] = None
+    sample_index: Optional[int] = None
+    phase: Optional[str] = None
 
     def to_string(self) -> str:
         return f"{self.instance_id}_{self.repetition_id}"

@@ -144,12 +144,15 @@ class BasePPOExp:
 
             generator_cls = SkyRLGymGenerator
 
+        from skyrl.train.generators.trace_record import build_trace_recorder_from_env
+
         return generator_cls(
             generator_cfg=cfg.generator,
             skyrl_gym_cfg=cfg.environment.skyrl_gym,
             inference_engine_client=inference_engine_client,
             tokenizer=tokenizer,
             policy_model_name=resolve_policy_model_name(cfg),
+            trace_recorder=build_trace_recorder_from_env(cfg),
         )
 
     def get_trainer(

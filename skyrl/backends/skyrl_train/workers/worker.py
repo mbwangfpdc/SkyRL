@@ -812,6 +812,22 @@ class PolicyWorkerBase(Worker):
             f"[perf-breakdown] backward op profile (call #{self._perf_bwd_call_count}):\n{table}"
         )
 
+        # --- allocator-pressure diagnostic (gated by the same SKYRL_PROFILE_BWD
+        # flag/cadence as the op-level table above): investigating whether
+        # cpu_offload=false's larger resident optimizer state (~21G/GPU fp32
+        # Adam moments) causes PyTorch allocator pressure that could bleed into
+        # NCCL's own buffer allocation (NCCL_CUMEM_ENABLE=0 is set repo-wide,
+        # so NCCL is on the legacy, non-cuMem allocation path and may contend
+        # with PyTorch's caching allocator for the same physical pool). ---
+        _mstats = torch.cuda.memory_stats()
+        logger.opt(depth=1).info(
+            f"[perf-breakdown] cuda memory stats (call #{self._perf_bwd_call_count}): "
+            f"num_alloc_retries={_mstats.get('num_alloc_retries', 0)} "
+            f"active_bytes.all.current={_mstats.get('active_bytes.all.current', 0) / 1e9:.2f}GB "
+            f"reserved_bytes.all.current={_mstats.get('reserved_bytes.all.current', 0) / 1e9:.2f}GB "
+            f"allocated_bytes.all.current={_mstats.get('allocated_bytes.all.current', 0) / 1e9:.2f}GB"
+        )
+
     def forward_backward(
         self,
         data: TrainingInputBatch,

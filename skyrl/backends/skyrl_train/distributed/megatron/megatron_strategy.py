@@ -135,6 +135,10 @@ class MegatronStrategy(DistributedStrategy):
         node_local_rank: int = 0,
     ) -> None:
         super().__init__()
+        if optimizer_config is not None and getattr(optimizer_config, "cpu_adam", False):
+            raise NotImplementedError(
+                "optimizer_config.cpu_adam=True is only implemented for the fsdp strategy."
+            )
         self.megatron_config = megatron_config
         self.optimizer_config = optimizer_config
         self.seed = seed

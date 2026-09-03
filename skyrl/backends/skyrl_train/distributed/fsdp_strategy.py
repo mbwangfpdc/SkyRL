@@ -48,6 +48,11 @@ from skyrl.backends.skyrl_train.utils.io import io
 from skyrl.backends.skyrl_train.workers.model_wrapper import HFModelWrapper
 from skyrl.train.config import FSDPConfig, ModelConfig, OptimizerConfig
 
+try:
+    from torch.distributed.tensor import DTensor
+except ImportError:
+    from torch.distributed._tensor import DTensor
+
 if version.parse(torch.__version__) >= version.parse("2.6"):
     from torch.distributed.fsdp import (
         CPUOffloadPolicy,
@@ -93,13 +98,40 @@ class FSDPStrategy(DistributedStrategy):
 
         # if we are using fsdp 1 or cpu offload is off for fsdp2, then we need to manually offload weights/optimizer to cpu
         self.manual_offload = self.fsdp_strategy == "fsdp" or not self.fsdp_config.cpu_offload
+        self.cpu_adam = bool(self.optimizer_config is not None and self.optimizer_config.cpu_adam)
+        if self.cpu_adam and self.fsdp_strategy != "fsdp2":
+            raise NotImplementedError(
+                "optimizer_config.cpu_adam=True is only implemented for fsdp_strategy='fsdp2' -- it "
+                "relies on FSDP2's per-parameter DTensor sharding to clone/writeback named CPU "
+                "masters; FSDP1's flat-parameter sharding (use_orig_params=False) is incompatible "
+                "with that."
+            )
+        if self.cpu_adam and self.fsdp_config.cpu_offload:
+            raise ValueError(
+                "optimizer_config.cpu_adam=True is incompatible with fsdp_config.cpu_offload=True: "
+                "both keep a full CPU-resident copy of the model/optimizer via different "
+                "mechanisms, so stacking them only doubles CPU memory for no benefit. Pick one."
+            )
         if self.optimizer_config is not None:
-            self.manual_offload_optimizer = self.optimizer_config.offload_after_step and self.manual_offload
+            # cpu_adam keeps optimizer state on CPU by construction (see _fsdp_init_train_model /
+            # optimizer_step) -- offload_after_step's GPU<->CPU round trip would be pure overhead
+            # on top of that, so cpu_adam takes precedence rather than stacking with it.
+            self.manual_offload_optimizer = (
+                self.optimizer_config.offload_after_step and self.manual_offload and not self.cpu_adam
+            )
         else:
             self.manual_offload_optimizer = False
 
         # LoRA related configs
         self.is_lora = self.model_config.lora.rank > 0 if self.model_config is not None else False
+        if self.cpu_adam and self.is_lora:
+            raise NotImplementedError("optimizer_config.cpu_adam=True is not yet supported with LoRA.")
+
+        # cpu_adam: per-role dict of CPU fp32 master nn.Parameters, keyed by the FSDP module's
+        # named_parameters() name. Populated in _fsdp_init_train_model; the optimizer is built
+        # directly over these instead of the GPU-resident FSDP2 shards. See optimizer_step for the
+        # per-step grad-copy-down / step-on-CPU / value-copy-back sequence.
+        self._cpu_master: dict = {}
 
         self.time_steps = defaultdict(int)
 
@@ -206,13 +238,55 @@ class FSDPStrategy(DistributedStrategy):
             else:
                 logger.warning(f"grad_norm is not finite: {grad_norm}")
             optimizer.zero_grad()
+            if self.cpu_adam:
+                # optimizer.zero_grad() above only clears the CPU masters' .grad (they are what
+                # `optimizer` was built over); the GPU model's own .grad was never touched on this
+                # skip path, so clear it too or the next backward's accumulation would be wrong.
+                for _, param in model.named_parameters():
+                    param.grad = None
             return grad_norm
+
+        if self.cpu_adam:
+            # grad_norm above is already the value to report (computed pre-clip on the GPU model,
+            # same as the non-cpu_adam path); the CPU step itself doesn't produce a new one.
+            self._cpu_adam_step(model, optimizer, scheduler)
+        else:
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+            optimizer.zero_grad()
+        return grad_norm
+
+    def _cpu_adam_step(self, model, optimizer, scheduler):
+        """cpu_adam optimizer step: grad clipping has already run on the GPU model above.
+
+        Copies grad shards GPU->CPU into the persistent masters, steps AdamW on CPU, copies the
+        updated values back into the live GPU shards in place. Optimizer *state*
+        (exp_avg/exp_avg_sq) never leaves CPU -- only this one-shot grad-down / weight-up copy
+        crosses PCIe, unlike offload_after_step's round trip of the full optimizer state every step.
+        """
+        device = torch.cuda.current_device()
+        for name, param in model.named_parameters():
+            if param.grad is None:
+                continue
+            local_grad = param.grad.to_local() if isinstance(param.grad, DTensor) else param.grad
+            self._cpu_master[name].grad = local_grad.detach().to(
+                device="cpu", dtype=self._cpu_master[name].dtype, non_blocking=True,
+            )
+        torch.cuda.synchronize()
+        for _, param in model.named_parameters():
+            param.grad = None
 
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
         optimizer.zero_grad()
-        return grad_norm
+
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                local = param.to_local() if isinstance(param, DTensor) else param.data
+                local.copy_(self._cpu_master[name].to(device, dtype=local.dtype), non_blocking=True)
+        torch.cuda.synchronize()
 
     @time_func("FSDPStrategy.prepare")
     def prepare(
@@ -301,6 +375,37 @@ class FSDPStrategy(DistributedStrategy):
 
         return fsdp_module
 
+    def _init_cpu_adam_masters(self, fsdp_module) -> list:
+        """Build persistent CPU master weights for cpu_adam and return the optimizer's param list.
+
+        One fp32 (``optimizer_config.master_dtype``) CPU clone per named parameter's local shard.
+        The FSDP2 model is left untouched here -- it stays GPU-resident and is what forward/backward
+        run against; optimizer_step() copies grads into these masters, steps AdamW on them, then
+        copies the updated values back into the GPU shards in place. Unlike granular's
+        dynamic_groups mode, there is no shared-memory store: SkyRL never rebuilds the FSDP group
+        mid-run, so plain in-process tensors are enough, and they round-trip through the existing
+        per-rank optimizer.state_dict() checkpoint path unchanged.
+        """
+        master_dtype = PrecisionType.to_dtype(self.optimizer_config.master_dtype)
+        # Ray pins each actor to a single CPU thread by default; AdamW's foreach update is
+        # embarrassingly parallel and memory-bandwidth-bound, so that leaves most of the box idle.
+        # Mirrors granular-cais-rl's cpu_adam thread tuning (~5.5x measured at 32 threads/rank).
+        n_threads = int(os.environ.get("SKYRL_CPU_ADAM_THREADS", "0")) or max(
+            8, min(32, (os.cpu_count() or 16) // max(1, 2 * self.world_size))
+        )
+        torch.set_num_threads(n_threads)
+        logger.info(
+            f"[cpu_adam] rank={self.get_rank()}: torch intra-op CPU threads -> {n_threads} "
+            f"(cpu_count={os.cpu_count()}, world_size={self.world_size}, master_dtype={master_dtype})"
+        )
+        self._cpu_master = {}
+        for name, param in fsdp_module.named_parameters():
+            local = param.to_local() if isinstance(param, DTensor) else param
+            self._cpu_master[name] = nn.Parameter(
+                local.detach().to(device="cpu", dtype=master_dtype, copy=True)
+            )
+        return list(self._cpu_master.values())
+
     @time_func("FSDPStrategy._fsdp_init_train_model")
     def _fsdp_init_train_model(self, model, optimizer, scheduler):
         """Initialize a model for training with FSDP"""
@@ -309,8 +414,11 @@ class FSDPStrategy(DistributedStrategy):
 
         optim_config = self.optimizer_config
         if optim_config is not None:
+            opt_params = (
+                self._init_cpu_adam_masters(fsdp_module) if self.cpu_adam else fsdp_module.parameters()
+            )
             new_optimizer = optim.AdamW(
-                fsdp_module.parameters(),
+                opt_params,
                 lr=optim_config.lr,
                 betas=optim_config.adam_betas,
                 weight_decay=optim_config.weight_decay,
@@ -627,6 +735,17 @@ class FSDPStrategy(DistributedStrategy):
                 # Load model state dict
                 load_model.load_state_dict(model_state_dict, strict=load_module_strict)
                 self.print(f"[rank-{rank}]: Successfully loaded model state dict")
+
+                # cpu_adam: the masters were cloned from the GPU model's weights at construction time
+                # (init_model), before this checkpoint's weights were loaded into it above -- refresh
+                # them from the now-current GPU values so the next optimizer.step() resumes from the
+                # checkpoint's weights, not the pre-load ones. In-place so the Parameter identity
+                # (what optimizer.load_state_dict below keys exp_avg/exp_avg_sq by) is unchanged.
+                if self.cpu_adam and self._cpu_master:
+                    with torch.no_grad():
+                        for name, param in load_model.named_parameters():
+                            local = param.to_local() if isinstance(param, DTensor) else param.data
+                            self._cpu_master[name].data.copy_(local.to("cpu", dtype=self._cpu_master[name].dtype))
 
                 # Load optimizer state dict if optimizer object is provided and loading is requested
                 if optimizer is not None and load_optimizer_states and optimizer_state_dict:

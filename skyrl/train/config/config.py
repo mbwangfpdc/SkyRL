@@ -80,10 +80,33 @@ class OptimizerConfig(BaseConfig):
     weight_decay: float = 1e-2
     max_grad_norm: float = 1.0
     offload_after_step: bool = True
-    """Offload optimizer state to CPU after each full training step. Only applicable when ``colocate_all=True``."""
+    """Offload optimizer state to CPU after each full training step. Only applicable when
+    ``colocate_all=True``, and is inert when ``fsdp_config.cpu_offload=True`` or
+    ``cpu_adam=True`` since both then keep the optimizer off the GPU by construction."""
     num_warmup_steps: int = 0
     """Number of mini-batch steps to warmup the optimizer."""
     scheduler: str = "constant_with_warmup"
+    """Learning rate scheduler. Intended to align with ``transformers.SchedulerType``:
+    https://huggingface.co/docs/transformers/main/en/main_classes/optimizer_schedules#transformers.SchedulerType"""
+    cpu_adam: bool = False
+    """Keep persistent fp32 (``master_dtype``) optimizer master weights resident on CPU and step
+    AdamW there directly, instead of on the GPU-resident FSDP2 shards. Unlike
+    ``offload_after_step``, optimizer state (``exp_avg``/``exp_avg_sq``) never moves between GPU
+    and CPU -- only the (much smaller, one-shot) per-step gradient copy down and updated-weight
+    copy back cross the PCIe bus, which is the actual per-step transfer ``offload_after_step``
+    pays but this mode avoids. The FSDP2 model itself is unaffected and stays GPU-resident as
+    normal, so this is mutually exclusive with ``fsdp_config.cpu_offload=True`` (that already
+    keeps a CPU-resident copy of everything via a different mechanism; stacking the two just
+    doubles CPU memory for no benefit) -- rejected at strategy init. FSDP-only; not supported
+    under the megatron strategy. Ported from granular-cais-rl's ``cpu_adam``, minus its
+    ``dynamic_groups`` shared-memory master store: SkyRL never reshards the training group
+    mid-run, so the masters are plain in-process CPU tensors and the existing per-rank
+    ``optimizer.state_dict()`` checkpoint save/load picks them up unchanged."""
+    master_dtype: str = "fp32"
+    """Dtype of the CPU master weights when ``cpu_adam=True`` (ignored otherwise). fp32 masters
+    let sub-ULP updates (lr much smaller than bf16's rounding granularity) accumulate instead of
+    being lost every step; the GPU shards still receive a ``param_dtype``-downcast copy of the
+    master after each step, so forward/backward precision is unchanged."""
 
 
 @dataclass

@@ -3,6 +3,7 @@ import gc
 import json
 import os
 import random
+import time
 from collections import defaultdict
 from datetime import timedelta
 from typing import List, Optional, Union
@@ -265,6 +266,12 @@ class FSDPStrategy(DistributedStrategy):
         (exp_avg/exp_avg_sq) never leaves CPU -- only this one-shot grad-down / weight-up copy
         crosses PCIe, unlike offload_after_step's round trip of the full optimizer state every step.
         """
+        # --- perf breakdown instrumentation (diagnostic; not part of the metrics pipeline) ---
+        # Mirrors the [perf-breakdown] style in worker.py's forward_backward. Confirms the cost is
+        # actually where the design intends: grad_copy/writeback bounded by the one-shot PCIe
+        # transfer of the (much smaller than 2x-state) grad/weight tensors, step_cpu dominated by
+        # CPU-bound AdamW and roughly independent of anything GPU-side.
+        _t0 = time.time()
         device = torch.cuda.current_device()
         for name, param in model.named_parameters():
             if param.grad is None:
@@ -276,17 +283,26 @@ class FSDPStrategy(DistributedStrategy):
         torch.cuda.synchronize()
         for _, param in model.named_parameters():
             param.grad = None
+        _t1 = time.time()
 
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
         optimizer.zero_grad()
+        _t2 = time.time()
 
         with torch.no_grad():
             for name, param in model.named_parameters():
                 local = param.to_local() if isinstance(param, DTensor) else param.data
                 local.copy_(self._cpu_master[name].to(device, dtype=local.dtype), non_blocking=True)
         torch.cuda.synchronize()
+        _t3 = time.time()
+        logger.opt(depth=1).info(
+            "[cpu-adam-breakdown] rank={rank}: grad_copy_gpu2cpu={gc:.3f}s step_cpu={st:.3f}s "
+            "writeback_cpu2gpu={wb:.3f}s total={tot:.3f}s".format(
+                rank=self.get_rank(), gc=_t1 - _t0, st=_t2 - _t1, wb=_t3 - _t2, tot=_t3 - _t0,
+            )
+        )
 
     @time_func("FSDPStrategy.prepare")
     def prepare(

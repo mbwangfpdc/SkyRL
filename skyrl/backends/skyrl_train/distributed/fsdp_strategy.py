@@ -252,10 +252,23 @@ class FSDPStrategy(DistributedStrategy):
             # same as the non-cpu_adam path); the CPU step itself doesn't produce a new one.
             self._cpu_adam_step(model, optimizer, scheduler)
         else:
+            # Same [*-breakdown] diagnostic style as _cpu_adam_step, timing the structurally
+            # equivalent span (optimizer.step()/scheduler.step()/zero_grad(), post-clip) so the
+            # two are directly comparable. Whatever GPU<->CPU round trip offload_after_step does
+            # happens outside this method (in offload_to_cpu/backload_to_gpu, called from
+            # worker_dispatch's _ensure_on_gpu/_offload) and is NOT included here -- with
+            # offload_after_step=false this is the pure GPU-resident case, no CPU involvement at
+            # all.
+            _t0 = time.time()
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
             optimizer.zero_grad()
+            torch.cuda.synchronize()
+            _t1 = time.time()
+            logger.opt(depth=1).info(
+                f"[no-adam-breakdown] rank={self.get_rank()}: step_gpu={_t1 - _t0:.3f}s"
+            )
         return grad_norm
 
     def _cpu_adam_step(self, model, optimizer, scheduler):

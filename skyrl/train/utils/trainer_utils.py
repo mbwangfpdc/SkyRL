@@ -554,6 +554,25 @@ def handle_filter_sampling(
 
     # Filter out groups with std == 0 and group size > 1
     kept_uids = [uid for uid, std in uid2metric_std.items() if std > 0 or n_samples_per_prompt == 1]
+
+    # A prompt's `uid` is a stable identifier from the dataset row (prepare_generator_input),
+    # not scoped to this resample round -- so the SAME prompt can legitimately be drawn again
+    # in a later round while filter sampling is still accumulating toward target_batch_size.
+    # Without deduplicating against uids already collected from earlier rounds, that prompt's
+    # second occurrence lands non-contiguously in the concatenated batch (interleaved with
+    # whatever else got collected in between), which breaks compute_prompt_boundaries'
+    # consecutive-equal-entries-are-one-group invariant ("uid ... appears in non-contiguous
+    # positions"). Drop already-collected uids from this round's keep set before accumulating.
+    already_collected_uids = set(collected_state.get("collected_uids", []))
+    if already_collected_uids:
+        duplicate_uids = [uid for uid in kept_uids if uid in already_collected_uids]
+        if duplicate_uids:
+            logger.warning(
+                f"Dynamic sampling filter: dropping {len(duplicate_uids)} prompt(s) already "
+                f"collected in an earlier resample round (would otherwise duplicate non-"
+                f"contiguously): {duplicate_uids}"
+            )
+        kept_uids = [uid for uid in kept_uids if uid not in already_collected_uids]
     kept_uids_set = set(kept_uids)
 
     # Filter trajectories based on kept UIDs
@@ -561,6 +580,16 @@ def handle_filter_sampling(
     for idx, traj_uid in enumerate(uids):
         if traj_uid in kept_uids_set:
             kept_traj_idxs.append(idx)
+
+    if not kept_traj_idxs:
+        # Nothing to add this round -- either every group in it had zero variance (possible
+        # even pre-dedup, just unlikely), or the dedup above dropped everything as already
+        # collected. slice_generator_output requires non-empty indices, so skip straight to
+        # requesting another resample round instead of calling it with an empty list.
+        logger.info("============= Dynamic sampling filter =============")
+        logger.info("Dynamic sampling: 0 new (non-duplicate, non-zero-variance) prompts this round, continue sampling...")
+        logger.info("==================================================")
+        return generator_output, uids, True, collected_state
 
     # Apply filtering to generator output
     filtered_output = filter_generator_output(generator_output, kept_traj_idxs)

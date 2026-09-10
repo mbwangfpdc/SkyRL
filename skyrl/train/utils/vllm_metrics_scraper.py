@@ -295,9 +295,24 @@ class VLLMMetricsScraper:
         un-paused, so time accumulates immediately; call :meth:`pause` right
         after if the work between ``start`` and the first generation should be
         excluded from the throughput denominator.
+
+        Self-heals a stale open window (left behind by some earlier exception
+        between a `start`/`stop` pair, e.g. a network blip mid-scrape) rather
+        than raising: this is diagnostics/wandb-logging plumbing, not core
+        training, so it must never be able to take down a training run over a
+        bookkeeping mismatch. Discards that window's incomplete metrics and
+        logs a warning so the underlying cause (if it recurs) stays visible.
         """
         if self._label is not None:
-            raise ValueError(f"`start({label!r})` called while window {self._label!r} is still open")
+            logger.warning(
+                f"VLLMMetricsScraper: `start({label!r})` called while window {self._label!r} "
+                "was still open (an earlier exception likely skipped its `stop()`); discarding "
+                "the stale window's metrics and continuing rather than crashing the training run."
+            )
+            self._label = None
+            self._window_prev = None
+            self._active_since = None
+            self._paused = False
         self._window_prev = await self._read_snapshot()
         self._label = label
         self._window_time_s = 0.0

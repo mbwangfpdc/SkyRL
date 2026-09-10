@@ -798,12 +798,19 @@ def slice_generator_output(
     dynamic sampling may intentionally select entries from different trajectories.
     """
     assert len(indices) > 0, "indices must be non-empty"
-    # Every key except `rollout_metrics` is either a per-entry list to slice, or None.
+    # Every key except `rollout_metrics` and `trajectory_time_splits` is either a
+    # per-entry list to slice, or None. `trajectory_time_splits` is itself per-entry
+    # data, but shaped as a dict of named component lists (e.g. {"llm": [...],
+    # "env": [...]}, one entry per trajectory in each inner list, same indexing as
+    # every other field) rather than a flat per-entry list -- so it needs its inner
+    # lists sliced individually instead of being sliced (or passed through) directly.
     sliced: GeneratorOutput = {}
     for key, value in generator_output.items():
         if key == "rollout_metrics":
             if preserve_metrics:
                 sliced[key] = value
+        elif key == "trajectory_time_splits":
+            sliced[key] = {name: [times[i] for i in indices] for name, times in value.items()} if value else value
         elif value is None:
             sliced[key] = None
         else:

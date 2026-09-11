@@ -912,7 +912,13 @@ class AlgorithmConfig(BaseConfig):
     """Normalize advantages by the standard deviation in GRPO.
     Set to False for Dr. GRPO (https://arxiv.org/abs/2503.20783)."""
     zero_variance_filter: bool = False
-    """Loss-mask prompts with zero-variance rewards. Only applicable when rewards are response-level."""
+    """Loss-mask prompts with zero-variance rewards, and truncate their trajectories to a 1-token
+    stub so they don't pay full forward/backward cost for a zero-gradient contribution (see
+    ``Trainer.postprocess_generator_output``). Works for both response-level (``List[float]``) and
+    token-level (``List[List[float]]``) rewards -- the latter (e.g. any multi-turn agent-loop
+    environment not using ``custom_chat_template``) is grouped by summing each trajectory's
+    token-level rewards to a sequence-level scalar first, matching how ``dynamic_sampling``'s
+    "filter"/"replace" strategies already do this."""
     zero_variance_filter_tol: float = 1e-6
     """Two rewards within this absolute tolerance count as equal when detecting zero-variance groups.
     Only used when ``zero_variance_filter=True``. Defaults to 1e-6 so float (LLM-judge) rewards that are

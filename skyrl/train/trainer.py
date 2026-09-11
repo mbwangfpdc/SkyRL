@@ -1026,6 +1026,15 @@ class RayPPOTrainer:
 
         In the future algorithm specific reward or loss mask post processing should be done here.
 
+        With ``trainer.algorithm.zero_variance_filter=True``, trajectories belonging to a
+        zero-variance group are additionally truncated to a 1-token stub (in ``generator_output``
+        only, not ``metrics_generator_output``) so their forward/backward cost collapses to near
+        nothing instead of running the full completion length for a masked-out (zero-gradient)
+        contribution. Trajectory *count* is left unchanged, since ``compute_prompt_mini_batch_
+        boundaries`` requires exactly ``train_batch_size`` prompts per batch. Applies for both
+        response-level and token-level reward shapes (the latter -- e.g. any multi-turn
+        agent-loop environment -- is grouped by summing each trajectory to a scalar first).
+
         Reward metrics are computed over ``metrics_generator_output`` / ``metrics_uids`` when provided
         (a superset of the trained output -- e.g. sample_full_batch passes the dropped groups so metrics
         stay comparable), otherwise over ``generator_output`` / ``uids``. The per-token / loss-mask
@@ -1078,27 +1087,82 @@ class RayPPOTrainer:
         responses: List[List[int]] = generator_output["response_ids"]
         per_token_rewards: List[List[float]] = []
 
+        def _apply_zero_variance_filter(seq_rewards: List[float], token_aligned_lists: List[Optional[list]]) -> None:
+            """Loss-mask and truncate zero-variance-group trajectories in place.
+
+            `seq_rewards` is one scalar reward per trajectory, used to group by uid and detect
+            zero-variance groups (std == 0 within tolerance). `token_aligned_lists` are the
+            per-trajectory, per-token lists that must all stay the same length as each other
+            for a given trajectory (e.g. response_ids, loss_masks, rollout_logprobs, and -- for
+            the token-level-reward caller -- the token-level rewards list itself); entries that
+            are ``None`` (an absent optional field) are skipped.
+            """
+            kept_indices_set = set(
+                zero_variance_filter(
+                    seq_rewards,
+                    uids,
+                    loss_masks=generator_output["loss_masks"],
+                    tol=self.cfg.trainer.algorithm.zero_variance_filter_tol,
+                )
+            )
+            num_groups = len(set(uids))
+            num_kept_groups = len({uids[i] for i in kept_indices_set})
+            self.all_metrics["reward/num_zero_variance_filtered"] = num_groups - num_kept_groups
+
+            # Shrink dropped (zero-variance) trajectories to a 1-token stub instead of only
+            # loss-masking their full length in place. Loss-masking alone still runs the entire
+            # original completion (up to `max_generate_length` tokens) through forward/backward
+            # for zero gradient contribution -- pure wasted compute, since GRPO's advantage is
+            # already exactly 0 for every member of a zero-variance group with or without this
+            # filter. We can't drop these trajectories from the batch outright:
+            # `compute_prompt_mini_batch_boundaries` hard-asserts every batch has exactly
+            # `train_batch_size` prompts x `n_samples_per_prompt` trajectories (relied on for
+            # policy/critic mini-batch dispatch), so the trajectory *count* must stay fixed.
+            # Truncating to 1 token keeps that invariant while collapsing the actual compute
+            # cost of these trajectories (attention/MLP over sequence length) to near nothing --
+            # only the response tail is discarded, the shared prompt is untouched.
+            lists_to_truncate = [lst for lst in token_aligned_lists if lst is not None]
+            for i in range(len(uids)):
+                if i in kept_indices_set:
+                    continue
+                for lst in lists_to_truncate:
+                    lst[i] = lst[i][:1]
+
         # Check if rewards are already token-level (List[List[float]]) or response-level (List[float])
         if rewards and isinstance(rewards[0], list):
-            # Token-level rewards: rewards is List[List[float]]
+            # Token-level rewards: rewards is List[List[float]]. SkyRL-SQL's multi-turn agent
+            # loop (any environment not using `custom_chat_template` -- skyrl_gym_generator.py's
+            # `_build_per_token_rewards`) always returns this shape, so this is the common case
+            # for real agentic workloads, not an edge case -- zero_variance_filter needs to apply
+            # here too, not just in the response-level branch below (its previous response-level-
+            # only implementation was silently a no-op for exactly this kind of workload).
             per_token_rewards = rewards
+            if self.cfg.trainer.algorithm.zero_variance_filter:
+                # zero_variance_filter groups by a per-trajectory scalar; collapse token-level
+                # rewards to sequence-level the same way handle_filter_sampling/
+                # handle_replace_sampling already do for the same purpose.
+                seq_rewards = [float(sum(r)) for r in rewards]
+                _apply_zero_variance_filter(
+                    seq_rewards,
+                    [
+                        responses,
+                        generator_output["loss_masks"],
+                        rewards,  # == per_token_rewards: must shrink in lockstep with responses
+                        generator_output.get("rollout_logprobs"),
+                        generator_output.get("rollout_expert_indices"),
+                    ],
+                )
         else:
             if self.cfg.trainer.algorithm.zero_variance_filter:
-                kept_indices_set = set(
-                    zero_variance_filter(
-                        rewards,
-                        uids,
-                        loss_masks=generator_output["loss_masks"],
-                        tol=self.cfg.trainer.algorithm.zero_variance_filter_tol,
-                    )
+                _apply_zero_variance_filter(
+                    rewards,
+                    [
+                        responses,
+                        generator_output["loss_masks"],
+                        generator_output.get("rollout_logprobs"),
+                        generator_output.get("rollout_expert_indices"),
+                    ],
                 )
-                num_groups = len(set(uids))
-                num_kept_groups = len({uids[i] for i in kept_indices_set})
-                self.all_metrics["reward/num_zero_variance_filtered"] = num_groups - num_kept_groups
-                generator_output["loss_masks"] = [
-                    [0] * len(mask) if i not in kept_indices_set else mask
-                    for i, mask in enumerate(generator_output["loss_masks"])
-                ]
             # Response-level rewards: rewards is List[float], convert to per-token rewards
             for reward, response in zip(rewards, responses):
                 per_token_reward = [0.0] * len(response)

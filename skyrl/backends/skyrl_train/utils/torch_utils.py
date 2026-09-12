@@ -19,13 +19,20 @@ from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 from jaxtyping import Float, Integer
+from loguru import logger
 
 try:
     from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
 
     FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = True
-except ImportError:
+    logger.info("[perf-diag] flash_attn.ops.triton.cross_entropy available -- using fused logprobs_from_logits path")
+except Exception as e:  # noqa: BLE001 -- diagnostic: any import-time failure (not just ImportError,
+    # e.g. a triton API mismatch) should fall back the same way and be visible, not swallowed.
     FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = False
+    logger.warning(
+        f"[perf-diag] flash_attn.ops.triton.cross_entropy NOT available ({type(e).__name__}: {e}) -- "
+        "falling back to logprobs_from_logits_v2 (slow, unvectorized per-row log_softmax for bf16 logits)"
+    )
 
 
 def chunked_cross_entropy_from_log_probs(

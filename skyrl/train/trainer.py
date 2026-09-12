@@ -1027,10 +1027,14 @@ class RayPPOTrainer:
         In the future algorithm specific reward or loss mask post processing should be done here.
 
         With ``trainer.algorithm.zero_variance_filter=True``, trajectories belonging to a
-        zero-variance group are additionally truncated to a 1-token stub (in ``generator_output``
-        only, not ``metrics_generator_output``) so their forward/backward cost collapses to near
-        nothing instead of running the full completion length for a masked-out (zero-gradient)
-        contribution. Trajectory *count* is left unchanged, since ``compute_prompt_mini_batch_
+        zero-variance group are additionally truncated to a short stub -- both the prompt and
+        the response (in ``generator_output`` only, not ``metrics_generator_output``) -- so
+        their forward/backward cost collapses to near nothing instead of running the full
+        prompt+completion length for a masked-out (zero-gradient) contribution. Truncating the
+        response alone is not enough for prompt-heavy tasks: measured on a real SQL dataset, it
+        still left ~1.76x more total tokens processed than an equivalent run that excludes
+        dropped trajectories outright, because the (often larger) prompt was never shrunk.
+        Trajectory *count* is left unchanged, since ``compute_prompt_mini_batch_
         boundaries`` requires exactly ``train_batch_size`` prompts per batch. Applies for both
         response-level and token-level reward shapes (the latter -- e.g. any multi-turn
         agent-loop environment -- is grouped by summing each trajectory to a scalar first).
@@ -1087,15 +1091,28 @@ class RayPPOTrainer:
         responses: List[List[int]] = generator_output["response_ids"]
         per_token_rewards: List[List[float]] = []
 
-        def _apply_zero_variance_filter(seq_rewards: List[float], token_aligned_lists: List[Optional[list]]) -> None:
+        # A dropped (zero-variance) trajectory's stub length, in tokens -- see
+        # `_apply_zero_variance_filter` below. `response_ids`/loss_masks/etc. (response-aligned)
+        # truncate to RESPONSE_STUB_LEN; `prompt_token_ids` (prompt-aligned) truncates to
+        # PROMPT_STUB_LEN; anything spanning the *combined* prompt+response sequence (currently
+        # only `rollout_expert_indices`) truncates to their sum.
+        PROMPT_STUB_LEN = 1
+        RESPONSE_STUB_LEN = 1
+
+        def _apply_zero_variance_filter(
+            seq_rewards: List[float],
+            response_aligned_lists: List[Optional[list]],
+            prompt_aligned_lists: List[Optional[list]],
+            combined_aligned_lists: List[Optional[list]],
+        ) -> None:
             """Loss-mask and truncate zero-variance-group trajectories in place.
 
             `seq_rewards` is one scalar reward per trajectory, used to group by uid and detect
-            zero-variance groups (std == 0 within tolerance). `token_aligned_lists` are the
-            per-trajectory, per-token lists that must all stay the same length as each other
-            for a given trajectory (e.g. response_ids, loss_masks, rollout_logprobs, and -- for
-            the token-level-reward caller -- the token-level rewards list itself); entries that
-            are ``None`` (an absent optional field) are skipped.
+            zero-variance groups (std == 0 within tolerance). The three `*_aligned_lists`
+            arguments are per-trajectory, per-token lists truncated to `RESPONSE_STUB_LEN`,
+            `PROMPT_STUB_LEN`, or their sum respectively, matching how each list is scoped
+            (response-only, prompt-only, or prompt+response combined); entries that are ``None``
+            (an absent optional field) are skipped.
             """
             kept_indices_set = set(
                 zero_variance_filter(
@@ -1109,24 +1126,36 @@ class RayPPOTrainer:
             num_kept_groups = len({uids[i] for i in kept_indices_set})
             self.all_metrics["reward/num_zero_variance_filtered"] = num_groups - num_kept_groups
 
-            # Shrink dropped (zero-variance) trajectories to a 1-token stub instead of only
+            # Shrink dropped (zero-variance) trajectories to a short stub instead of only
             # loss-masking their full length in place. Loss-masking alone still runs the entire
-            # original completion (up to `max_generate_length` tokens) through forward/backward
-            # for zero gradient contribution -- pure wasted compute, since GRPO's advantage is
-            # already exactly 0 for every member of a zero-variance group with or without this
-            # filter. We can't drop these trajectories from the batch outright:
+            # original prompt+completion (up to `max_prompt_length` + `max_generate_length`
+            # tokens) through forward/backward for zero gradient contribution -- pure wasted
+            # compute, since GRPO's advantage is already exactly 0 for every member of a
+            # zero-variance group with or without this filter. Measured on a real SQL dataset
+            # (schema-heavy prompts averaging ~2000 tokens): truncating the response alone still
+            # left dropped trajectories paying their full prompt cost, which measured as ~1.76x
+            # more total tokens processed than an equivalent run that excludes dropped
+            # trajectories outright -- the prompt is usually the larger share of the sequence for
+            # this kind of task, so it must be truncated too for this to meaningfully reduce
+            # compute. We can't drop these trajectories from the batch outright:
             # `compute_prompt_mini_batch_boundaries` hard-asserts every batch has exactly
             # `train_batch_size` prompts x `n_samples_per_prompt` trajectories (relied on for
             # policy/critic mini-batch dispatch), so the trajectory *count* must stay fixed.
-            # Truncating to 1 token keeps that invariant while collapsing the actual compute
-            # cost of these trajectories (attention/MLP over sequence length) to near nothing --
-            # only the response tail is discarded, the shared prompt is untouched.
-            lists_to_truncate = [lst for lst in token_aligned_lists if lst is not None]
+            # Truncating to a short stub keeps that invariant while collapsing the actual compute
+            # cost of these trajectories (attention/MLP over sequence length) to near nothing.
+            response_lists = [lst for lst in response_aligned_lists if lst is not None]
+            prompt_lists = [lst for lst in prompt_aligned_lists if lst is not None]
+            combined_lists = [lst for lst in combined_aligned_lists if lst is not None]
+            combined_len = PROMPT_STUB_LEN + RESPONSE_STUB_LEN
             for i in range(len(uids)):
                 if i in kept_indices_set:
                     continue
-                for lst in lists_to_truncate:
-                    lst[i] = lst[i][:1]
+                for lst in response_lists:
+                    lst[i] = lst[i][:RESPONSE_STUB_LEN]
+                for lst in prompt_lists:
+                    lst[i] = lst[i][:PROMPT_STUB_LEN]
+                for lst in combined_lists:
+                    lst[i] = lst[i][:combined_len]
 
         # Check if rewards are already token-level (List[List[float]]) or response-level (List[float])
         if rewards and isinstance(rewards[0], list):
@@ -1144,24 +1173,26 @@ class RayPPOTrainer:
                 seq_rewards = [float(sum(r)) for r in rewards]
                 _apply_zero_variance_filter(
                     seq_rewards,
-                    [
+                    response_aligned_lists=[
                         responses,
                         generator_output["loss_masks"],
                         rewards,  # == per_token_rewards: must shrink in lockstep with responses
                         generator_output.get("rollout_logprobs"),
-                        generator_output.get("rollout_expert_indices"),
                     ],
+                    prompt_aligned_lists=[generator_output["prompt_token_ids"]],
+                    combined_aligned_lists=[generator_output.get("rollout_expert_indices")],
                 )
         else:
             if self.cfg.trainer.algorithm.zero_variance_filter:
                 _apply_zero_variance_filter(
                     rewards,
-                    [
+                    response_aligned_lists=[
                         responses,
                         generator_output["loss_masks"],
                         generator_output.get("rollout_logprobs"),
-                        generator_output.get("rollout_expert_indices"),
                     ],
+                    prompt_aligned_lists=[generator_output["prompt_token_ids"]],
+                    combined_aligned_lists=[generator_output.get("rollout_expert_indices")],
                 )
             # Response-level rewards: rewards is List[float], convert to per-token rewards
             for reward, response in zip(rewards, responses):

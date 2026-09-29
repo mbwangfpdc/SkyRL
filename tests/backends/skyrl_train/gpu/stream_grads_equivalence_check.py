@@ -8,15 +8,24 @@ AdamW masters/moments in fp32), 3 steps x 3 micro-batches with clipping forced a
     torchrun --nproc_per_node=2 stream_grads_equivalence_check.py run --mode stream   --out DIR
     python stream_grads_equivalence_check.py compare --out DIR
 
-`run` saves, per rank: reported (pre-clip) grad norms, the step-1 CPU gradients AdamW consumed,
+`run` saves, per rank: reported (pre-clip) grad norms, the step-1 accumulated pre-clip gradients
+(GPU .grad for cpu_adam, the drained CPU accumulators for stream), the step-1 CPU gradients AdamW
+consumed,
 final weights, per-step timings, and GPU memory (peak and right after backward, relative to the
 run's starting allocation). `compare` checks:
 
-  * step-1 gradients: both runs start from identical weights there, so they must agree up to bf16
-    rounding (the clip multiply rounds each bf16 element, and the clip coefficient differs by the
-    bf16 rounding of the norm). Compared pre-clip (post-clip grads * (norm + 1e-6) / max_norm).
+  * step-1 accumulated pre-clip gradients: identical starting weights and data, and streaming's
+    accumulate-via-GPU does the same bf16 adds as FSDP2's on-GPU accumulation, so these must be
+    BIT-EXACT.
+  * step-1 clipped gradients (what AdamW consumed): agree to bf16 rounding -- the bulk-copy path
+    clips in bf16 with a bf16-rounded norm, streaming with an fp32 norm fused into the fp32
+    upcast. Compared after undoing each run's clip (* (norm + 1e-6) / max_norm).
   * step-1 norm within bf16 precision; later steps drift legitimately (Adam's m/sqrt(v) amplifies
-    rounding-level grad differences to +-lr), so later norms and final weights are loose checks.
+    rounding-level grad differences to +-lr per element per step, in either direction), so later
+    norms and final weights (bound 2 * lr * steps) are loose checks.
+
+`--seq` sets tokens per micro-batch (default 64: correctness; e.g. 4096: timing with realistic
+backward compute to overlap the transfers with).
   * memory: after backward the streaming run must hold less GPU memory (no resident grads).
 """
 
@@ -52,7 +61,7 @@ def build_model():
     return Qwen2ForCausalLM(cfg).to(torch.bfloat16)
 
 
-def run(mode: str, out: str):
+def run(mode: str, out: str, seq: int):
     import torch.distributed as dist
     from torch.distributed.tensor import DTensor
 
@@ -98,12 +107,13 @@ def run(mode: str, out: str):
 
     gen = torch.Generator().manual_seed(1234 + rank)
     norms, peaks, post_bwd, t_fb, t_opt, grad_dtypes = [], [], [], [], [], set()
-    for _ in range(STEPS):
+    pre_clip0 = None
+    for step in range(STEPS):
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
         t0 = time.time()
         for _ in range(MICRO_BATCHES):
-            ids = torch.randint(0, VOCAB, (2, SEQ), generator=gen).cuda()
+            ids = torch.randint(0, VOCAB, (2, seq), generator=gen).cuda()
             loss = model(input_ids=ids, labels=ids).loss / MICRO_BATCHES
             strategy.backward(loss, model, optimizer)
         torch.cuda.synchronize()
@@ -114,10 +124,22 @@ def run(mode: str, out: str):
             grad_dtypes |= {str(g.dtype) for g in strategy._cpu_grad.values()}
         else:
             grad_dtypes |= {str(p.grad.dtype) for p in model.parameters() if p.grad is not None}
+        if step == 0:  # outside both timed windows
+            if mode == "stream":
+                torch.cuda.synchronize()
+                pre_clip0 = {n: strategy._cpu_grad[n].clone() for n in strategy._cpu_grad_filled}
+            else:
+                pre_clip0 = {
+                    n: (p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad).detach().cpu().clone()
+                    for n, p in model.named_parameters()
+                    if p.grad is not None
+                }
+            torch.cuda.synchronize()
+        t2 = time.time()
         norms.append(float(strategy.optimizer_step(optimizer, model, scheduler)))
         torch.cuda.synchronize()
         t_fb.append(t1 - t0)
-        t_opt.append(time.time() - t1)
+        t_opt.append(time.time() - t2)
 
     weights = {
         n: (p.to_local() if isinstance(p, DTensor) else p).detach().cpu().clone()
@@ -129,6 +151,8 @@ def run(mode: str, out: str):
             "mode": mode,
             "norms": norms,
             "grads0": grad_snaps[0],
+            "pre_clip0": pre_clip0,
+            "seq": seq,
             "weights": weights,
             "peak_mib": peaks,
             "post_bwd_mib": post_bwd,
@@ -139,6 +163,7 @@ def run(mode: str, out: str):
         os.path.join(out, f"{mode}_rank{rank}.pt"),
     )
     if rank == 0:
+        print(f"[{mode}] seq={seq}")
         print(f"[{mode}] norms={norms} grad_dtypes={sorted(grad_dtypes)}")
         print(f"[{mode}] peak MiB={[round(x) for x in peaks]} post-backward MiB={[round(x) for x in post_bwd]}")
         print(f"[{mode}] fwd+bwd s={[round(x, 3) for x in t_fb]} optimizer_step s={[round(x, 3) for x in t_opt]}")
@@ -152,6 +177,11 @@ def compare(out: str) -> bool:
     for r in ranks:
         a = torch.load(os.path.join(out, f"cpu_adam_rank{r}.pt"))
         b = torch.load(os.path.join(out, f"stream_rank{r}.pt"))
+        assert a["seq"] == b["seq"], (a["seq"], b["seq"])
+        pa, pb = a["pre_clip0"], b["pre_clip0"]
+        pre_keys_ok = set(pa) == set(pb)
+        pre_mismatch = [n for n in pa if not torch.equal(pa[n], pb[n])] if pre_keys_ok else ["<key mismatch>"]
+        pre_max = max(((pa[n].float() - pb[n].float()).abs().max().item() for n in pa), default=0.0) if pre_keys_ok else float("inf")
         ga, gb = a["grads0"], b["grads0"]
         keys_ok = set(ga) == set(gb)
         # Undo the (active) clip so the two runs' slightly different coefficients don't count.
@@ -168,19 +198,22 @@ def compare(out: str) -> bool:
         mem_ok = b["post_bwd_mib"][-1] < a["post_bwd_mib"][-1]
         bf16_ok = a["grad_dtypes"] == b["grad_dtypes"] == ["torch.bfloat16"]
         checks = {
+            "step-1 accumulated pre-clip grads bit-exact": pre_keys_ok and not pre_mismatch,
             "grad keys match": keys_ok,
             "grads bf16 in both": bf16_ok,
-            "step-1 grads per-tensor rel <= 1e-2": g_rel_max <= 1e-2,
+            "step-1 clipped grads per-tensor rel <= 1e-2": g_rel_max <= 1e-2,
             "step-1 norm rel <= 8e-3 (bf16 eps)": norm0_rel <= 8e-3,
             "all norms rel <= 5e-2": norm_rel <= 5e-2,
-            "weights within lr*steps": w_diff <= LR * STEPS * 1.01,
+            "weights within 2*lr*steps": w_diff <= 2 * LR * STEPS * 1.01,
             "clipping active": clipped,
             "stream holds less GPU memory after backward": mem_ok,
         }
-        print(f"--- rank {r}")
+        print(f"--- rank {r} (seq={a['seq']})")
+        print(f"step-1 accumulated pre-clip grads: {len(pa)} tensors, {len(pre_mismatch)} not bit-exact"
+              f"{' e.g. ' + pre_mismatch[0] if pre_mismatch else ''}, max abs diff {pre_max:.2e}")
         print(f"norms cpu_adam: {a['norms']}")
         print(f"norms stream  : {b['norms']}")
-        print(f"step-1 pre-clip grads per-tensor rel diff: max {g_rel_max:.2e} ({per[-1][1]}), median {g_rel_med:.2e}")
+        print(f"step-1 clipped grads (clip undone) per-tensor rel diff: max {g_rel_max:.2e} ({per[-1][1]}), median {g_rel_med:.2e}")
         print(f"step-1 norm rel {norm0_rel:.2e}; all-steps norm rel max {norm_rel:.2e}; weights max abs diff {w_diff:.2e}")
         for k in ("peak_mib", "post_bwd_mib", "t_fwd_bwd", "t_opt"):
             print(f"{k:13s} cpu_adam {[round(x, 3) for x in a[k]]}  stream {[round(x, 3) for x in b[k]]}")
@@ -196,8 +229,9 @@ if __name__ == "__main__":
     ap.add_argument("cmd", choices=["run", "compare"])
     ap.add_argument("--mode", choices=["cpu_adam", "stream"])
     ap.add_argument("--out", required=True)
+    ap.add_argument("--seq", type=int, default=SEQ)
     args = ap.parse_args()
     if args.cmd == "run":
-        run(args.mode, args.out)
+        run(args.mode, args.out, args.seq)
     else:
         raise SystemExit(0 if compare(args.out) else 1)

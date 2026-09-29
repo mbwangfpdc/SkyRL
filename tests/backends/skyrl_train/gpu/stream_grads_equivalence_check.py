@@ -24,6 +24,11 @@ run's starting allocation). `compare` checks:
     rounding-level grad differences to +-lr per element per step, in either direction), so later
     norms and final weights (bound 2 * lr * steps) are loose checks.
 
+`--tag` names a run's result files (default: the mode); `compare --floor TAG` also loads a second
+cpu_adam run saved under TAG and judges the pre-clip and clipped gradient checks against the
+cpu_adam-vs-cpu_adam difference instead of bit-exactness (at longer sequences the attention and
+embedding backward kernels are not bit-deterministic run to run).
+
 `--seq` sets tokens per micro-batch (default 64: correctness; e.g. 4096: timing with realistic
 backward compute to overlap the transfers with).
   * memory: after backward the streaming run must hold less GPU memory (no resident grads).
@@ -61,7 +66,7 @@ def build_model():
     return Qwen2ForCausalLM(cfg).to(torch.bfloat16)
 
 
-def run(mode: str, out: str, seq: int):
+def run(mode: str, out: str, seq: int, tag: str):
     import torch.distributed as dist
     from torch.distributed.tensor import DTensor
 
@@ -160,7 +165,7 @@ def run(mode: str, out: str, seq: int):
             "t_opt": t_opt,
             "grad_dtypes": sorted(grad_dtypes),
         },
-        os.path.join(out, f"{mode}_rank{rank}.pt"),
+        os.path.join(out, f"{tag}_rank{rank}.pt"),
     )
     if rank == 0:
         print(f"[{mode}] seq={seq}")
@@ -170,7 +175,20 @@ def run(mode: str, out: str, seq: int):
     dist.destroy_process_group()
 
 
-def compare(out: str) -> bool:
+def _pre_clip_diff(pa, pb):
+    """(#tensors not bit-exact, max abs diff, max per-tensor relative L2 diff) between two runs."""
+    if set(pa) != set(pb):
+        return len(pa), float("inf"), float("inf")
+    n_bad = sum(not torch.equal(pa[n], pb[n]) for n in pa)
+    max_abs = max(((pa[n].float() - pb[n].float()).abs().max().item() for n in pa), default=0.0)
+    max_rel = max(
+        (((pa[n].float() - pb[n].float()).norm() / pa[n].float().norm().clamp_min(1e-30)).item() for n in pa),
+        default=0.0,
+    )
+    return n_bad, max_abs, max_rel
+
+
+def compare(out: str, floor: str = None) -> bool:
     ranks = sorted(int(f.split("rank")[1][:-3]) for f in os.listdir(out) if f.startswith("cpu_adam_rank"))
     assert ranks, f"no results in {out}"
     ok = True
@@ -180,8 +198,21 @@ def compare(out: str) -> bool:
         assert a["seq"] == b["seq"], (a["seq"], b["seq"])
         pa, pb = a["pre_clip0"], b["pre_clip0"]
         pre_keys_ok = set(pa) == set(pb)
-        pre_mismatch = [n for n in pa if not torch.equal(pa[n], pb[n])] if pre_keys_ok else ["<key mismatch>"]
-        pre_max = max(((pa[n].float() - pb[n].float()).abs().max().item() for n in pa), default=0.0) if pre_keys_ok else float("inf")
+        pre_bad, pre_max, pre_rel = _pre_clip_diff(pa, pb)
+        fl = None
+        if floor:
+            f = torch.load(os.path.join(out, f"{floor}_rank{r}.pt"))
+            assert f["seq"] == a["seq"], (f["seq"], a["seq"])
+            fl_bad, fl_max, fl_rel = _pre_clip_diff(pa, f["pre_clip0"])
+            fg = f["grads0"]
+            uf = (f["norms"][0] + 1e-6) / MAX_NORM
+            ua_ = (a["norms"][0] + 1e-6) / MAX_NORM
+            fl_clip_rel = max(
+                (((a["grads0"][n] * ua_ - fg[n] * uf).norm() / (a["grads0"][n] * ua_).norm().clamp_min(1e-30)).item()
+                 for n in a["grads0"]),
+                default=0.0,
+            )
+            fl = (fl_bad, fl_max, fl_rel, fl_clip_rel)
         ga, gb = a["grads0"], b["grads0"]
         keys_ok = set(ga) == set(gb)
         # Undo the (active) clip so the two runs' slightly different coefficients don't count.
@@ -198,10 +229,15 @@ def compare(out: str) -> bool:
         mem_ok = b["post_bwd_mib"][-1] < a["post_bwd_mib"][-1]
         bf16_ok = a["grad_dtypes"] == b["grad_dtypes"] == ["torch.bfloat16"]
         checks = {
-            "step-1 accumulated pre-clip grads bit-exact": pre_keys_ok and not pre_mismatch,
+            (
+                "step-1 accumulated pre-clip grads bit-exact"
+                if fl is None or fl[0] == 0
+                else "step-1 accumulated pre-clip grads rel <= 2x cpu_adam-vs-cpu_adam floor"
+            ): pre_keys_ok and (pre_bad == 0 if fl is None or fl[0] == 0 else pre_rel <= 2 * fl[2]),
             "grad keys match": keys_ok,
             "grads bf16 in both": bf16_ok,
-            "step-1 clipped grads per-tensor rel <= 1e-2": g_rel_max <= 1e-2,
+            "step-1 clipped grads per-tensor rel <= max(1e-2, 2x floor)": g_rel_max
+            <= max(1e-2, 2 * fl[3] if fl else 0.0),
             "step-1 norm rel <= 8e-3 (bf16 eps)": norm0_rel <= 8e-3,
             "all norms rel <= 5e-2": norm_rel <= 5e-2,
             "weights within 2*lr*steps": w_diff <= 2 * LR * STEPS * 1.01,
@@ -209,8 +245,11 @@ def compare(out: str) -> bool:
             "stream holds less GPU memory after backward": mem_ok,
         }
         print(f"--- rank {r} (seq={a['seq']})")
-        print(f"step-1 accumulated pre-clip grads: {len(pa)} tensors, {len(pre_mismatch)} not bit-exact"
-              f"{' e.g. ' + pre_mismatch[0] if pre_mismatch else ''}, max abs diff {pre_max:.2e}")
+        print(f"step-1 accumulated pre-clip grads stream-vs-cpu_adam: {len(pa)} tensors, {pre_bad} not bit-exact, "
+              f"max abs diff {pre_max:.2e}, max per-tensor rel {pre_rel:.2e}")
+        if fl:
+            print(f"  floor cpu_adam-vs-cpu_adam ({floor}): {fl[0]} not bit-exact, max abs diff {fl[1]:.2e}, "
+                  f"max per-tensor rel {fl[2]:.2e}; clipped-grad rel {fl[3]:.2e}")
         print(f"norms cpu_adam: {a['norms']}")
         print(f"norms stream  : {b['norms']}")
         print(f"step-1 clipped grads (clip undone) per-tensor rel diff: max {g_rel_max:.2e} ({per[-1][1]}), median {g_rel_med:.2e}")
@@ -230,8 +269,10 @@ if __name__ == "__main__":
     ap.add_argument("--mode", choices=["cpu_adam", "stream"])
     ap.add_argument("--out", required=True)
     ap.add_argument("--seq", type=int, default=SEQ)
+    ap.add_argument("--tag", default=None, help="result file prefix for run (default: the mode)")
+    ap.add_argument("--floor", default=None, help="compare: tag of a second cpu_adam run for the noise floor")
     args = ap.parse_args()
     if args.cmd == "run":
-        run(args.mode, args.out, args.seq)
+        run(args.mode, args.out, args.seq, args.tag or args.mode)
     else:
-        raise SystemExit(0 if compare(args.out) else 1)
+        raise SystemExit(0 if compare(args.out, args.floor) else 1)

@@ -140,6 +140,7 @@ class FSDPStrategy(DistributedStrategy):
         self._cpu_grad_for_master: dict = {}
         self._grad_hooked_ids: set = set()
         self._stream_clip_coef: float = 1.0
+        self._grad_offload_stream = None
 
         self.time_steps = defaultdict(int)
 
@@ -229,11 +230,14 @@ class FSDPStrategy(DistributedStrategy):
 
         FSDP2's foreach_reduce invokes sharded params' post-accumulate-grad hooks inside
         `with stream(post_reduce_stream)`, i.e. on the stream that produced the reduce-scatter
-        output, so everything below is ordered after the reduction without extra syncs, and
-        consecutive micro-batches' copies of the same accumulator are ordered with each other.
-        Dropping param.grad (and `running`) releases GPU memory that is only reused by later ops
-        on that same stream, which run after these copies -- the same reasoning FSDP2's own
-        CPUOffloadPolicy relies on to free the GPU gradient without waiting for its D2H copy.
+        output. The transfers go on a dedicated offload stream that first waits on that one, so
+        they are ordered after the reduction but do not hold up later reduce-scatters, and
+        FSDP2's end-of-backward wait (on its post-reduce event) does not wait for them either:
+        micro-batch k's copies overlap micro-batch k+1's forward, and only the last micro-batch's
+        tail lands in optimizer_step's drain. All copies of an accumulator are on this one
+        stream, so consecutive micro-batches stay ordered. `local` was allocated on the
+        reduce-scatter stream, so record_stream keeps its memory from being reused before the
+        offload stream is done with it; `running` is allocated on the offload stream itself.
 
         Micro-batch accumulation uses ZeRO-Offload's accumulate-via-GPU: the running CPU sum is
         brought back one tensor at a time, added on the GPU and copied out again, so backward
@@ -246,18 +250,24 @@ class FSDPStrategy(DistributedStrategy):
         local = grad.to_local() if isinstance(grad, DTensor) else grad
         local = local.detach()
         accum = self._cpu_grad[name]
-        if name not in self._cpu_grad_filled:
-            running = local
-            self._cpu_grad_filled.add(name)
-        else:
-            running = accum.to(local.device, non_blocking=True)
-            running.add_(local)
-        accum.copy_(running, non_blocking=True)
-        self._grad_sqnorm[name] = torch.linalg.vector_norm(running, dtype=torch.float32).square()
+        if self._grad_offload_stream is None:
+            self._grad_offload_stream = torch.cuda.Stream(device=local.device)
+        offload = self._grad_offload_stream
+        offload.wait_stream(torch.cuda.current_stream(local.device))
+        with torch.cuda.stream(offload):
+            if name not in self._cpu_grad_filled:
+                running = local
+                self._cpu_grad_filled.add(name)
+            else:
+                running = accum.to(local.device, non_blocking=True)
+                running.add_(local)
+            accum.copy_(running, non_blocking=True)
+            self._grad_sqnorm[name] = torch.linalg.vector_norm(running, dtype=torch.float32).square()
+        local.record_stream(offload)
         param.grad = None
 
     def _drain_grad_stream(self) -> None:
-        """Make every streamed gradient visible on CPU (all D2H copies complete)."""
+        """Make every streamed gradient visible on CPU (all D2H copies, on every stream, done)."""
         torch.cuda.synchronize()
 
     def _reset_grad_stream(self) -> None:

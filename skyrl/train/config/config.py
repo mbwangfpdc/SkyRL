@@ -225,6 +225,16 @@ class OptimizerConfig(BaseConfig):
     let sub-ULP updates (lr much smaller than bf16's rounding granularity) accumulate instead of
     being lost every step; the GPU shards still receive a ``param_dtype``-downcast copy of the
     master after each step, so forward/backward precision is unchanged."""
+    stream_grads_to_cpu: bool = False
+    """ZeRO-Offload-style gradient offload on top of ``cpu_adam`` (requires ``cpu_adam=True``).
+    Parameters stay GPU-resident (no param offload, unlike ``fsdp_config.cpu_offload``), but each
+    layer's gradient shard is copied to a persistent pinned CPU fp32 buffer right after its
+    reduce-scatter *during backward* and the GPU copy is freed immediately, so the GPU never holds
+    the full sharded gradient and the D2H transfer overlaps the rest of backward instead of
+    running as one bulk copy after it. Micro-batch accumulation happens on CPU; clipping computes
+    the global norm from the CPU buffers (one scalar NCCL all-reduce). Matches the ZeRO-Offload
+    paper's placement (Ren et al., 2021) except that the CPU step is ``torch.optim.AdamW``, not
+    DeepSpeed's SIMD CPU-Adam, and there is no delayed parameter update."""
 
 
 @dataclass

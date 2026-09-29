@@ -98,6 +98,14 @@ class FSDPStrategy(DistributedStrategy):
                 "both keep a full CPU-resident copy of the model/optimizer via different "
                 "mechanisms, so stacking them only doubles CPU memory for no benefit. Pick one."
             )
+        self.stream_grads = bool(
+            self.optimizer_config is not None and getattr(self.optimizer_config, "stream_grads_to_cpu", False)
+        )
+        if self.stream_grads and not self.cpu_adam:
+            raise ValueError(
+                "optimizer_config.stream_grads_to_cpu=True requires optimizer_config.cpu_adam=True: the "
+                "streamed gradients land in buffers paired with cpu_adam's CPU master weights."
+            )
         if self.optimizer_config is not None:
             # cpu_adam keeps optimizer state on CPU by construction (see _fsdp_init_train_model /
             # optimizer_step) -- offload_after_step's GPU<->CPU round trip would be pure overhead
@@ -119,6 +127,18 @@ class FSDPStrategy(DistributedStrategy):
         # per-step grad-copy-down / step-on-CPU / value-copy-back sequence.
         self._cpu_master: dict = {}
 
+        # stream_grads_to_cpu (ZeRO-Offload-style): per-name pinned CPU gradient accumulators
+        # (master_dtype), filled by per-parameter hooks that fire right after each FSDP2
+        # reduce-scatter during backward. `_cpu_grad_filled` holds names written since the last
+        # optimizer step (first write is a plain D2H copy, later micro-batches go through a pinned
+        # staging buffer + CPU add on `_grad_add_pool`). See _stream_grad_hook.
+        self._cpu_grad: dict = {}
+        self._cpu_grad_staging: dict = {}
+        self._cpu_grad_filled: set = set()
+        self._grad_hooked_ids: set = set()
+        self._grad_add_pool = None
+        self._grad_add_futures: list = []
+
         self.time_steps = defaultdict(int)
 
     def set_seed(self, seed: int) -> None:
@@ -138,6 +158,12 @@ class FSDPStrategy(DistributedStrategy):
         self.world_size = dist.get_world_size()
 
         self.device_mesh = create_device_mesh(world_size=self.world_size, fsdp_size=self.fsdp_config.fsdp_size)
+        if self.stream_grads and self.device_mesh.ndim != 1:
+            # _clip_streamed_grads sums local squared norms over the world group, which assumes
+            # every rank holds a disjoint shard; HSDP replicas would be counted multiple times.
+            raise NotImplementedError(
+                "optimizer_config.stream_grads_to_cpu=True supports pure FSDP only (fsdp_size=-1 or world_size)."
+            )
 
     def offload_to_cpu(self, model, optimizer, offload_optimizer=True, offload_model=True):
         """
@@ -173,7 +199,103 @@ class FSDPStrategy(DistributedStrategy):
 
     def backward(self, loss: torch.Tensor, model, optimizer: optim.Optimizer, **kwargs) -> None:
         """Perform backward pass"""
+        if self.stream_grads:
+            # Previous micro-batch's CPU adds must finish before this backward's hooks overwrite
+            # the staging buffers they read from.
+            self._wait_grad_adds()
+            self._ensure_grad_stream_hooks(model)
         loss.backward()
+
+    # --- stream_grads_to_cpu (ZeRO-Offload-style gradient streaming) -------------------------
+
+    def _ensure_grad_stream_hooks(self, model) -> None:
+        """Register the per-parameter offload hook on every FSDP2 sharded parameter not yet hooked.
+
+        Keyed by Parameter identity rather than done once at init: FSDP2's reset_sharded_param
+        (run by Module._apply, i.e. the colocate model offload/reload) can swap in a new
+        Parameter object, which would silently drop a hook registered only on the old one.
+        """
+        if isinstance(model, HFModelWrapper):
+            model = model.model
+        for name, param in model.named_parameters():
+            if id(param) in self._grad_hooked_ids:
+                continue
+            param.register_post_accumulate_grad_hook(
+                lambda p, _name=name: self._stream_grad_hook(_name, p)
+            )
+            self._grad_hooked_ids.add(id(param))
+
+    def _stream_grad_hook(self, name: str, param) -> None:
+        """Move one sharded gradient to CPU right after its reduce-scatter, then free it on GPU.
+
+        FSDP2's foreach_reduce invokes sharded params' post-accumulate-grad hooks inside
+        `with stream(post_reduce_stream)`, i.e. on the stream that produced the reduce-scatter
+        output, so the D2H copy is ordered after the reduction without extra syncs. Dropping
+        param.grad releases the GPU reduce-scatter output; its memory is only reused by later ops
+        on that same stream, which run after this copy -- the same reasoning FSDP2's own
+        CPUOffloadPolicy relies on to free the GPU gradient without waiting for its D2H copy.
+        """
+        grad = param.grad
+        if grad is None:
+            return
+        local = grad.to_local() if isinstance(grad, DTensor) else grad
+        accum = self._cpu_grad[name]
+        if name not in self._cpu_grad_filled:
+            accum.copy_(local.detach(), non_blocking=True)
+            self._cpu_grad_filled.add(name)
+        else:
+            # Accumulating micro-batch: the CPU add depends on the copy, so land it in a pinned
+            # staging buffer and do the add on a CPU worker thread once the copy's event fires.
+            staging = self._cpu_grad_staging.get(name)
+            if staging is None:
+                staging = torch.empty_like(accum, pin_memory=True)
+                self._cpu_grad_staging[name] = staging
+            staging.copy_(local.detach(), non_blocking=True)
+            event = torch.cuda.current_stream().record_event()
+            self._grad_add_futures.append(self._grad_add_pool.submit(self._cpu_grad_add, event, accum, staging))
+        param.grad = None
+
+    @staticmethod
+    def _cpu_grad_add(event, accum: torch.Tensor, staging: torch.Tensor) -> None:
+        event.synchronize()
+        accum.add_(staging)
+
+    def _wait_grad_adds(self) -> None:
+        futures, self._grad_add_futures = self._grad_add_futures, []
+        for f in futures:
+            f.result()
+
+    def _drain_grad_stream(self) -> None:
+        """Make every streamed gradient visible on CPU: pending D2H copies and CPU adds."""
+        torch.cuda.synchronize()
+        self._wait_grad_adds()
+
+    def scale_streamed_grads(self, scale: float) -> None:
+        """In-place scale of the CPU gradient accumulators (the GPU .grad is always None here)."""
+        self._drain_grad_stream()
+        for name in self._cpu_grad_filled:
+            self._cpu_grad[name].mul_(scale)
+
+    def _clip_streamed_grads(self) -> torch.Tensor:
+        """Global-L2-norm clip over the CPU gradient shards; returns the pre-clip norm (on GPU).
+
+        FSDP2 shards are disjoint across ranks (padding is not part of the local tensors), so the
+        global squared norm is the sum of per-rank local squared norms.
+        """
+        filled = [self._cpu_grad[n] for n in self._cpu_grad_filled]
+        local_sq = torch.zeros((), dtype=torch.float64)
+        if filled:
+            norms = torch._foreach_norm(filled, 2.0)
+            local_sq = torch.stack([n.double() for n in norms]).pow(2).sum()
+        total_sq = local_sq.to(torch.cuda.current_device())
+        if dist.is_initialized():
+            dist.all_reduce(total_sq, op=dist.ReduceOp.SUM)
+        total_norm = total_sq.sqrt().float()
+        if self.max_norm > 0 and torch.isfinite(total_norm):
+            clip_coef = self.max_norm / (total_norm.item() + 1e-6)
+            if clip_coef < 1.0 and filled:
+                torch._foreach_mul_(filled, clip_coef)
+        return total_norm
 
     def optimizer_step(
         self,
@@ -188,7 +310,11 @@ class FSDPStrategy(DistributedStrategy):
         if isinstance(model, HFModelWrapper):
             model = model.model
 
-        if self.max_norm > 0:
+        if self.stream_grads:
+            # Gradients already live on CPU (the GPU model's .grad is None); norm/clip there.
+            self._drain_grad_stream()
+            grad_norm = self._clip_streamed_grads()
+        elif self.max_norm > 0:
             # NOTE (sumanthrh): All `grad_norm`s returned here are the original grad norms before clipping.
             if FSDPModule is not None and isinstance(model, FSDPModule):
                 grad_norm = fsdp2_clip_grad_norm_(model.parameters(), max_norm=self.max_norm)
@@ -209,6 +335,8 @@ class FSDPStrategy(DistributedStrategy):
                 # skip path, so clear it too or the next backward's accumulation would be wrong.
                 for _, param in model.named_parameters():
                     param.grad = None
+                # Streamed accumulators: forget them so the next backward overwrites, not adds.
+                self._cpu_grad_filled.clear()
             return grad_norm
 
         if self.cpu_adam:
@@ -250,22 +378,30 @@ class FSDPStrategy(DistributedStrategy):
         # CPU-bound AdamW and roughly independent of anything GPU-side.
         _t0 = time.time()
         device = torch.cuda.current_device()
-        for name, param in model.named_parameters():
-            if param.grad is None:
-                continue
-            local_grad = param.grad.to_local() if isinstance(param.grad, DTensor) else param.grad
-            self._cpu_master[name].grad = local_grad.detach().to(
-                device="cpu", dtype=self._cpu_master[name].dtype, non_blocking=True,
-            )
-        torch.cuda.synchronize()
-        for _, param in model.named_parameters():
-            param.grad = None
+        if self.stream_grads:
+            # Already on CPU (streamed during backward, drained + clipped in optimizer_step): bind
+            # the pinned accumulators as the masters' grads. grad_copy below then measures ~0.
+            for name in self._cpu_grad_filled:
+                self._cpu_master[name].grad = self._cpu_grad[name]
+        else:
+            for name, param in model.named_parameters():
+                if param.grad is None:
+                    continue
+                local_grad = param.grad.to_local() if isinstance(param.grad, DTensor) else param.grad
+                self._cpu_master[name].grad = local_grad.detach().to(
+                    device="cpu", dtype=self._cpu_master[name].dtype, non_blocking=True,
+                )
+            torch.cuda.synchronize()
+            for _, param in model.named_parameters():
+                param.grad = None
         _t1 = time.time()
 
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
+        # set_to_none: unbinds the accumulators from the masters; the buffers stay in _cpu_grad.
         optimizer.zero_grad()
+        self._cpu_grad_filled.clear()
         _t2 = time.time()
 
         with torch.no_grad():
@@ -377,6 +513,24 @@ class FSDPStrategy(DistributedStrategy):
             local = param.to_local() if isinstance(param, DTensor) else param
             self._cpu_master[name] = nn.Parameter(
                 local.detach().to(device="cpu", dtype=master_dtype, copy=True)
+            )
+        if self.stream_grads:
+            # Persistent pinned gradient accumulators (pinned so the per-layer D2H copies in
+            # _stream_grad_hook are truly async). Hooks are attached lazily in backward().
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._cpu_grad = {
+                name: torch.zeros(m.shape, dtype=master_dtype, pin_memory=True)
+                for name, m in self._cpu_master.items()
+            }
+            self._cpu_grad_staging = {}
+            self._cpu_grad_filled = set()
+            self._grad_hooked_ids = set()
+            self._grad_add_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="grad_add")
+            logger.info(
+                f"[stream_grads] rank={self.get_rank()}: pinned CPU grad accumulators for "
+                f"{len(self._cpu_grad)} params "
+                f"({sum(g.numel() * g.element_size() for g in self._cpu_grad.values()) / 2**30:.2f} GiB)"
             )
         return list(self._cpu_master.values())
 

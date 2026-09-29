@@ -1573,9 +1573,13 @@ class CriticWorkerBase(Worker):
         # in forward_backward, so _micro_batches_accumulated stays 0 and no scaling needed.
         if self._micro_batches_accumulated > 0:
             scale = 1.0 / self._micro_batches_accumulated
-            for param in self.model.parameters():
-                if param.grad is not None:
-                    param.grad.mul_(scale)
+            if getattr(self.strategy, "stream_grads", False):
+                # Grads were streamed to CPU during backward; the GPU .grad is None here.
+                self.strategy.scale_streamed_grads(scale)
+            else:
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        param.grad.mul_(scale)
 
         # Perform optimizer step (includes gradient clipping)
         grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="critic")

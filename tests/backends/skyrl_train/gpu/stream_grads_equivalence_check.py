@@ -36,7 +36,6 @@ def build_model():
         num_attention_heads=8,
         num_key_value_heads=4,
         tie_word_embeddings=False,
-        torch_dtype=torch.float32,
     )
     return Qwen2ForCausalLM(cfg).to(torch.float32)
 

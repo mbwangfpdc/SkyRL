@@ -255,6 +255,17 @@ class FSDPConfig(BaseConfig):
     and ``fsdp_size=4``, training state is fully sharded across the 4 ranks within each node and
     replicated (data-parallel) across nodes."""
     mixed_precision: Optional[MixedPrecisionConfig] = None
+    pinned_host_stage: bool = True
+    """Stage GPU<->CPU copies through persistent pinned (page-locked) host buffers, allocated once
+    and reused every step: ``optimizer_config.cpu_adam``'s per-step gradient copy down to the CPU
+    masters, and the colocated manual model offload (``offload_to_cpu`` / ``backload_to_gpu``).
+    Against a fresh pageable tensor ``non_blocking=True`` is silently ignored and every
+    per-parameter copy blocks on its own; into pinned buffers they all queue back-to-back on the
+    copy engine before one synchronize. The model offload also frees the GPU shards in place
+    (storage resize, as FSDP2 does internally) instead of ``module.to("cpu")``. Ported from
+    granular-cais-rl's ``_pinned_stage``. Costs one pinned host copy of the local gradient shard
+    (at master dtype) and of the local weight shard. Inert with ``cpu_offload=True`` (FSDP2 keeps
+    its own pinned CPU copy there). ``False`` restores the pageable ``.to()`` paths."""
     # specify wrap policy as a dict with `transformer_layer_cls_to_wrap` key for custom module based wrapping
     wrap_policy: dict = field(default_factory=dict)
 

@@ -62,6 +62,27 @@ else:
     CPUOffloadPolicy, FSDPModule, MixedPrecisionPolicy = None, None, None
 
 
+def _pinned_stage(cache: dict, key, shape, dtype) -> torch.Tensor:
+    """Persistent pinned host buffer for ``key``, (re)allocated only when shape/dtype change.
+
+    ``.to("cpu", non_blocking=True)`` into a fresh pageable tensor silently blocks per copy;
+    ``copy_`` into a pinned buffer is a real async D2H, so a whole loop of per-parameter copies
+    queues on the copy engine before one synchronize. Allocating pinned memory is expensive
+    (cudaHostAlloc), hence the cache. Same helper as granular-cais-rl's train_worker.
+    """
+    buf = cache.get(key)
+    if buf is None or buf.shape != shape or buf.dtype != dtype:
+        buf = torch.empty(shape, dtype=dtype, pin_memory=True)
+        cache[key] = buf
+    return buf
+
+
+def _local(t: torch.Tensor) -> torch.Tensor:
+    """This rank's shard of an FSDP2 DTensor param or grad (shares its storage); a plain
+    parameter's ``.data`` otherwise."""
+    return t._local_tensor if isinstance(t, DTensor) else t.data
+
+
 class FSDPStrategy(DistributedStrategy):
     """
     The strategy for training with FSDP.
@@ -119,6 +140,14 @@ class FSDPStrategy(DistributedStrategy):
         # per-step grad-copy-down / step-on-CPU / value-copy-back sequence.
         self._cpu_master: dict = {}
 
+        # pinned_host_stage: persistent pinned buffers (see _pinned_stage) for cpu_adam's grad
+        # copy (keyed by param name) and the manual model offload (keyed by (id(module), name)),
+        # plus the offloaded modules' freed GPU storages, keyed by id(module).
+        self.pinned_host_stage = bool(getattr(self.fsdp_config, "pinned_host_stage", False))
+        self._grad_stage: dict = {}
+        self._model_stage: dict = {}
+        self._offloaded_storages: dict = {}
+
         self.time_steps = defaultdict(int)
 
     def set_seed(self, seed: int) -> None:
@@ -150,7 +179,10 @@ class FSDPStrategy(DistributedStrategy):
 
         if self.manual_offload:
             if offload_model:
-                offload_fsdp2_model_to_cpu(model, empty_cache=True)
+                if self.pinned_host_stage:
+                    self._offload_model_pinned(model)
+                else:
+                    offload_fsdp2_model_to_cpu(model, empty_cache=True)
 
             if optimizer is not None and self.manual_offload_optimizer and offload_optimizer:
                 offload_fsdp_optimizer(optimizer)
@@ -165,10 +197,58 @@ class FSDPStrategy(DistributedStrategy):
 
         if self.manual_offload:
             if backload_model:
-                load_fsdp2_model_to_gpu(model)
+                if self.pinned_host_stage:
+                    self._backload_model_pinned(model)
+                else:
+                    load_fsdp2_model_to_gpu(model)
             if optimizer is not None and self.manual_offload_optimizer and backload_optimizer:
                 load_fsdp_optimizer(optimizer, torch.cuda.current_device())
 
+        torch.cuda.synchronize()
+
+    @torch.no_grad()
+    def _offload_model_pinned(self, model) -> None:
+        """Copy every local weight shard into its persistent pinned buffer, then free the GPU storage.
+
+        The storage is resized to 0 in place (the mechanism FSDP2 itself uses to free unsharded
+        params), so every DTensor / FSDPParam view stays valid and the params keep reporting
+        device=cuda; buffers (tiny) stay on the GPU. Idempotent: a second call while offloaded is
+        a no-op. worker_dispatch tracks on/off-GPU state with its own flags, never via
+        param.device, so the unchanged device is invisible to it.
+        """
+        key = id(model)
+        if key in self._offloaded_storages:
+            return
+        storages, seen = [], set()
+        for name, p in model.named_parameters():
+            p.grad = None  # training always finishes with optimizer_step's zero_grad
+            local = _local(p)
+            buf = _pinned_stage(self._model_stage, (key, name), local.shape, local.dtype)
+            buf.copy_(local, non_blocking=True)
+            storage = local.untyped_storage()
+            if storage.data_ptr() not in seen:
+                seen.add(storage.data_ptr())
+                storages.append((storage, storage.size()))
+        torch.cuda.synchronize()
+        for storage, _ in storages:
+            storage.resize_(0)
+        self._offloaded_storages[key] = storages
+        torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def _backload_model_pinned(self, model) -> None:
+        """Re-grow the freed GPU storages and copy the weights back from the pinned buffers."""
+        storages = self._offloaded_storages.pop(id(model), None)
+        if storages is None:
+            return  # not offloaded (e.g. the first backload of the run)
+        device = torch.cuda.current_device()
+        for storage, size in storages:
+            storage.resize_(size)
+            # Zero the whole storage so FSDP2's shard padding bytes are defined before the copy
+            # fills the real region.
+            torch.empty(0, dtype=torch.uint8, device=device).set_(storage).zero_()
+        for name, p in model.named_parameters():
+            _local(p).copy_(self._model_stage[(id(model), name)], non_blocking=True)
         torch.cuda.synchronize()
 
     def backward(self, loss: torch.Tensor, model, optimizer: optim.Optimizer, **kwargs) -> None:
@@ -254,9 +334,15 @@ class FSDPStrategy(DistributedStrategy):
             if param.grad is None:
                 continue
             local_grad = param.grad.to_local() if isinstance(param.grad, DTensor) else param.grad
-            self._cpu_master[name].grad = local_grad.detach().to(
-                device="cpu", dtype=self._cpu_master[name].dtype, non_blocking=True,
-            )
+            master = self._cpu_master[name]
+            if self.pinned_host_stage:
+                # Persistent pinned buffer: a real async D2H, so all copies queue before the one
+                # synchronize below (granular-cais-rl's cpu_adam_grad_copy).
+                buf = _pinned_stage(self._grad_stage, name, local_grad.shape, master.dtype)
+                buf.copy_(local_grad.detach(), non_blocking=True)
+                master.grad = buf
+            else:
+                master.grad = local_grad.detach().to(device="cpu", dtype=master.dtype, non_blocking=True)
         torch.cuda.synchronize()
         for _, param in model.named_parameters():
             param.grad = None
@@ -271,7 +357,12 @@ class FSDPStrategy(DistributedStrategy):
         with torch.no_grad():
             for name, param in model.named_parameters():
                 local = param.to_local() if isinstance(param, DTensor) else param.data
-                local.copy_(self._cpu_master[name].to(device, dtype=local.dtype), non_blocking=True)
+                if self.pinned_host_stage:
+                    # Direct cross-device, cross-dtype copy into the shard (granular's writeback),
+                    # no intermediate full-precision GPU tensor per param.
+                    local.copy_(self._cpu_master[name], non_blocking=True)
+                else:
+                    local.copy_(self._cpu_master[name].to(device, dtype=local.dtype), non_blocking=True)
         torch.cuda.synchronize()
         _t3 = time.time()
         logger.opt(depth=1).info(

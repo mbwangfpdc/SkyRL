@@ -1,35 +1,43 @@
-"""Equivalence + memory check for optimizer_config.stream_grads_to_cpu (ZeRO-Offload-style).
+"""Functionality check: cpu_adam bulk-copy vs cpu_adam + stream_grads_to_cpu (ZeRO-Offload-style).
 
-Trains the same randomly-initialized tiny Qwen2 twice through FSDPStrategy -- cpu_adam with the
-post-backward bulk grad copy (reference) vs. cpu_adam + per-layer gradient streaming -- over a few
-optimizer steps with gradient accumulation and clipping forced active, then compares the reported
-grad norms, the step-1 CPU gradients element-wise (the strict check: both runs start from
-identical weights there), the final weights (loose: Adam's m/sqrt(v) amplifies rounding-level
-differences in near-zero grads to +-lr, so later steps drift apart legitimately), and peak GPU
-memory across forward+backward (the model is sized so gradients, not activations, dominate).
+Two separate tests, one process each, same randomly-initialized ~200M-param Qwen2 and the same
+data, everything bf16 except Adam (weights, compute, reduce-scatter and gradients in bf16; CPU
+AdamW masters/moments in fp32), 3 steps x 3 micro-batches with clipping forced active:
 
-Not a pytest file (needs >=2 GPUs under torchrun):
+    torchrun --nproc_per_node=2 stream_grads_equivalence_check.py run --mode cpu_adam --out DIR
+    torchrun --nproc_per_node=2 stream_grads_equivalence_check.py run --mode stream   --out DIR
+    python stream_grads_equivalence_check.py compare --out DIR
 
-    torchrun --nproc_per_node=2 tests/backends/skyrl_train/gpu/stream_grads_equivalence_check.py
+`run` saves, per rank: reported (pre-clip) grad norms, the step-1 CPU gradients AdamW consumed,
+final weights, per-step timings, and GPU memory (peak and right after backward, relative to the
+run's starting allocation). `compare` checks:
+
+  * step-1 gradients: both runs start from identical weights there, so they must agree up to bf16
+    rounding (the clip multiply rounds each bf16 element, and the clip coefficient differs by the
+    bf16 rounding of the norm). Compared pre-clip (post-clip grads * (norm + 1e-6) / max_norm).
+  * step-1 norm within bf16 precision; later steps drift legitimately (Adam's m/sqrt(v) amplifies
+    rounding-level grad differences to +-lr), so later norms and final weights are loose checks.
+  * memory: after backward the streaming run must hold less GPU memory (no resident grads).
 """
 
+import argparse
+import gc
 import os
+import time
 
 import torch
-import torch.distributed as dist
-from torch.distributed.tensor import DTensor
-from transformers import Qwen2Config, Qwen2ForCausalLM
-
-from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
-from skyrl.train.config import FSDPConfig, ModelConfig, OptimizerConfig
 
 STEPS = 3
 MICRO_BATCHES = 3
 SEQ = 64
 VOCAB = 32000
+LR = 1e-3
+MAX_NORM = 0.05
 
 
 def build_model():
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
     torch.manual_seed(0)
     cfg = Qwen2Config(
         vocab_size=VOCAB,
@@ -40,16 +48,41 @@ def build_model():
         num_key_value_heads=4,
         tie_word_embeddings=False,
     )
-    return Qwen2ForCausalLM(cfg).to(torch.float32)
+    # Init in fp32 then cast, so both modes get bit-identical bf16 starting weights.
+    return Qwen2ForCausalLM(cfg).to(torch.bfloat16)
 
 
-def run(stream: bool):
-    optim_cfg = OptimizerConfig(
-        lr=1e-3, cpu_adam=True, stream_grads_to_cpu=stream, max_grad_norm=0.05, offload_after_step=False
+def run(mode: str, out: str):
+    import torch.distributed as dist
+    from torch.distributed.tensor import DTensor
+
+    from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
+    from skyrl.train.config import FSDPConfig, MixedPrecisionConfig, ModelConfig, OptimizerConfig
+
+    dist.init_process_group("nccl")
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    rank = dist.get_rank()
+    gc.collect()
+    torch.cuda.empty_cache()
+    base_mib = torch.cuda.memory_allocated() / 2**20
+
+    fsdp_cfg = FSDPConfig(
+        mixed_precision=MixedPrecisionConfig(param_dtype="bf16", reduce_dtype="bf16", buffer_dtype="bf16")
     )
-    strategy = FSDPStrategy(fsdp_config=FSDPConfig(), optimizer_config=optim_cfg, model_config=ModelConfig())
+    optim_cfg = OptimizerConfig(
+        lr=LR,
+        cpu_adam=True,
+        master_dtype="fp32",
+        stream_grads_to_cpu=(mode == "stream"),
+        max_grad_norm=MAX_NORM,
+        offload_after_step=False,
+    )
+    strategy = FSDPStrategy(fsdp_config=fsdp_cfg, optimizer_config=optim_cfg, model_config=ModelConfig())
     strategy.setup_distributed()
     model, optimizer, scheduler = strategy.prepare((build_model(), None, None))
+
+    dtypes = {str(p.dtype) for p in model.parameters()}
+    assert dtypes == {"torch.bfloat16"}, f"model params not all bf16: {dtypes}"
 
     # Snapshot the CPU masters' grads (post-clip, what AdamW actually consumes) at each step.
     grad_snaps = []
@@ -63,88 +96,108 @@ def run(stream: bool):
 
     optimizer.step = step_with_snapshot
 
-    rank = dist.get_rank()
     gen = torch.Generator().manual_seed(1234 + rank)
-    norms, peaks, post_bwd = [], [], []
+    norms, peaks, post_bwd, t_fb, t_opt, grad_dtypes = [], [], [], [], [], set()
     for _ in range(STEPS):
         torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+        t0 = time.time()
         for _ in range(MICRO_BATCHES):
             ids = torch.randint(0, VOCAB, (2, SEQ), generator=gen).cuda()
             loss = model(input_ids=ids, labels=ids).loss / MICRO_BATCHES
             strategy.backward(loss, model, optimizer)
         torch.cuda.synchronize()
-        peaks.append(torch.cuda.max_memory_allocated() / 2**20)
-        # Allocated right after backward: includes the full sharded grads in the reference path.
-        post_bwd.append(torch.cuda.memory_allocated() / 2**20)
+        t1 = time.time()
+        peaks.append(torch.cuda.max_memory_allocated() / 2**20 - base_mib)
+        post_bwd.append(torch.cuda.memory_allocated() / 2**20 - base_mib)
+        if mode == "stream":
+            grad_dtypes |= {str(g.dtype) for g in strategy._cpu_grad.values()}
+        else:
+            grad_dtypes |= {str(p.grad.dtype) for p in model.parameters() if p.grad is not None}
         norms.append(float(strategy.optimizer_step(optimizer, model, scheduler)))
+        torch.cuda.synchronize()
+        t_fb.append(t1 - t0)
+        t_opt.append(time.time() - t1)
+
     weights = {
-        n: (p.to_local() if isinstance(p, DTensor) else p).detach().float().cpu().clone()
+        n: (p.to_local() if isinstance(p, DTensor) else p).detach().cpu().clone()
         for n, p in model.named_parameters()
     }
-    del model, optimizer, scheduler, strategy
-    torch.cuda.empty_cache()
-    return norms, weights, peaks, grad_snaps, post_bwd
-
-
-def main():
-    dist.init_process_group("nccl")
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    rank = dist.get_rank()
-
-    # Two reference runs: bf16 forward/backward kernels are not bit-deterministic, so ref-vs-ref
-    # gives the noise floor that ref-vs-stream is judged against.
-    ref_norms, ref_w, ref_peak, ref_g, ref_post = run(stream=False)
-    ref2_norms, _, _, ref2_g, _ = run(stream=False)
-    st_norms, st_w, st_peak, st_g, st_post = run(stream=True)
-
-    def grad_rel(a, b):
-        if set(a) != set(b):
-            return float("inf")
-        scale = max(g.abs().max().item() for g in a.values())
-        return max((a[n] - b[n]).abs().max().item() for n in a) / max(scale, 1e-30)
-
-    same_keys = set(ref_g[0]) == set(st_g[0])
-    g0_rel = grad_rel(ref_g[0], st_g[0])
-    g0_floor = grad_rel(ref_g[0], ref2_g[0])
-    norm0_rel = abs(ref_norms[0] - st_norms[0]) / ref_norms[0]
-    norm0_floor = abs(ref_norms[0] - ref2_norms[0]) / ref_norms[0]
-
-    max_w_diff = max((ref_w[n] - st_w[n]).abs().max().item() for n in ref_w)
-    max_w_scale = max(ref_w[n].abs().max().item() for n in ref_w)
-    norm_rel = max(abs(a - b) / max(abs(a), 1e-12) for a, b in zip(ref_norms, st_norms))
-    if rank == 0:
-        print(f"grad_norm ref   : {ref_norms}")
-        print(f"grad_norm stream: {st_norms}")
-        print(f"grad_norm max rel diff: {norm_rel:.3e}")
-        print(f"grad_norm ref2  : {ref2_norms}")
-        print(f"step-1 grads ({len(ref_g[0])} tensors, keys match={same_keys}): "
-              f"ref-vs-stream rel {g0_rel:.3e}, ref-vs-ref floor {g0_floor:.3e}")
-        print(f"step-1 norm: ref-vs-stream rel {norm0_rel:.3e}, ref-vs-ref floor {norm0_floor:.3e}")
-        print(f"weights max abs diff: {max_w_diff:.3e} (max |w| {max_w_scale:.3e})")
-        print(f"peak GPU MiB ref   : {[round(x) for x in ref_peak]}")
-        print(f"peak GPU MiB stream: {[round(x) for x in st_peak]}")
-        print(f"post-backward allocated MiB ref   : {[round(x) for x in ref_post]}")
-        print(f"post-backward allocated MiB stream: {[round(x) for x in st_post]}")
-    # Strict: step-1 grads element-wise and step-1 norm (identical starting weights) within a
-    # small multiple of the ref-vs-ref kernel-nondeterminism floor (plus fp32 epsilon slack).
-    # Loose: later norms, and weights within one Adam step (lr * STEPS) -- see module docstring.
-    # all(n > max_grad_norm) confirms clipping was actually exercised on every step.
-    # Memory: after backward the stream path must hold less than the reference (no GPU grads).
-    ok = (
-        same_keys
-        and g0_rel <= 3 * g0_floor + 1e-6
-        and norm0_rel <= 3 * norm0_floor + 1e-6
-        and st_post[-1] < ref_post[-1]
-        and norm_rel < 1e-2
-        and max_w_diff <= 1e-3 * STEPS * 1.01
-        and all(n > 0.05 for n in ref_norms)
+    os.makedirs(out, exist_ok=True)
+    torch.save(
+        {
+            "mode": mode,
+            "norms": norms,
+            "grads0": grad_snaps[0],
+            "weights": weights,
+            "peak_mib": peaks,
+            "post_bwd_mib": post_bwd,
+            "t_fwd_bwd": t_fb,
+            "t_opt": t_opt,
+            "grad_dtypes": sorted(grad_dtypes),
+        },
+        os.path.join(out, f"{mode}_rank{rank}.pt"),
     )
-    ok_t = torch.tensor(int(ok), device="cuda")
-    dist.all_reduce(ok_t, op=dist.ReduceOp.MIN)
     if rank == 0:
-        print("STREAM_GRADS_EQUIVALENCE:", "PASS" if ok_t.item() else "FAIL")
+        print(f"[{mode}] norms={norms} grad_dtypes={sorted(grad_dtypes)}")
+        print(f"[{mode}] peak MiB={[round(x) for x in peaks]} post-backward MiB={[round(x) for x in post_bwd]}")
+        print(f"[{mode}] fwd+bwd s={[round(x, 3) for x in t_fb]} optimizer_step s={[round(x, 3) for x in t_opt]}")
     dist.destroy_process_group()
 
 
+def compare(out: str) -> bool:
+    ranks = sorted(int(f.split("rank")[1][:-3]) for f in os.listdir(out) if f.startswith("cpu_adam_rank"))
+    assert ranks, f"no results in {out}"
+    ok = True
+    for r in ranks:
+        a = torch.load(os.path.join(out, f"cpu_adam_rank{r}.pt"))
+        b = torch.load(os.path.join(out, f"stream_rank{r}.pt"))
+        ga, gb = a["grads0"], b["grads0"]
+        keys_ok = set(ga) == set(gb)
+        # Undo the (active) clip so the two runs' slightly different coefficients don't count.
+        ua = (a["norms"][0] + 1e-6) / MAX_NORM
+        ub = (b["norms"][0] + 1e-6) / MAX_NORM
+        per = sorted(
+            (((ga[n] * ua - gb[n] * ub).norm() / (ga[n] * ua).norm().clamp_min(1e-30)).item(), n) for n in ga
+        ) if keys_ok else [(float("inf"), "<key mismatch>")]
+        g_rel_max, g_rel_med = per[-1][0], per[len(per) // 2][0]
+        norm0_rel = abs(a["norms"][0] - b["norms"][0]) / a["norms"][0]
+        norm_rel = max(abs(x - y) / x for x, y in zip(a["norms"], b["norms"]))
+        w_diff = max((a["weights"][n].float() - b["weights"][n].float()).abs().max().item() for n in a["weights"])
+        clipped = all(n > MAX_NORM for n in a["norms"] + b["norms"])
+        mem_ok = b["post_bwd_mib"][-1] < a["post_bwd_mib"][-1]
+        bf16_ok = a["grad_dtypes"] == b["grad_dtypes"] == ["torch.bfloat16"]
+        checks = {
+            "grad keys match": keys_ok,
+            "grads bf16 in both": bf16_ok,
+            "step-1 grads per-tensor rel <= 1e-2": g_rel_max <= 1e-2,
+            "step-1 norm rel <= 8e-3 (bf16 eps)": norm0_rel <= 8e-3,
+            "all norms rel <= 5e-2": norm_rel <= 5e-2,
+            "weights within lr*steps": w_diff <= LR * STEPS * 1.01,
+            "clipping active": clipped,
+            "stream holds less GPU memory after backward": mem_ok,
+        }
+        print(f"--- rank {r}")
+        print(f"norms cpu_adam: {a['norms']}")
+        print(f"norms stream  : {b['norms']}")
+        print(f"step-1 pre-clip grads per-tensor rel diff: max {g_rel_max:.2e} ({per[-1][1]}), median {g_rel_med:.2e}")
+        print(f"step-1 norm rel {norm0_rel:.2e}; all-steps norm rel max {norm_rel:.2e}; weights max abs diff {w_diff:.2e}")
+        for k in ("peak_mib", "post_bwd_mib", "t_fwd_bwd", "t_opt"):
+            print(f"{k:13s} cpu_adam {[round(x, 3) for x in a[k]]}  stream {[round(x, 3) for x in b[k]]}")
+        for k, v in checks.items():
+            print(f"  [{'ok' if v else 'FAIL'}] {k}")
+        ok &= all(checks.values())
+    print("STREAM_GRADS_EQUIVALENCE:", "PASS" if ok else "FAIL")
+    return ok
+
+
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", choices=["run", "compare"])
+    ap.add_argument("--mode", choices=["cpu_adam", "stream"])
+    ap.add_argument("--out", required=True)
+    args = ap.parse_args()
+    if args.cmd == "run":
+        run(args.mode, args.out)
+    else:
+        raise SystemExit(0 if compare(args.out) else 1)

@@ -228,7 +228,8 @@ class OptimizerConfig(BaseConfig):
     stream_grads_to_cpu: bool = False
     """ZeRO-Offload-style gradient offload on top of ``cpu_adam`` (requires ``cpu_adam=True``).
     Parameters stay GPU-resident (no param offload, unlike ``fsdp_config.cpu_offload``), but each
-    layer's gradient shard is copied to a persistent pinned CPU fp32 buffer right after its
+    layer's gradient shard is copied to a persistent pinned CPU buffer (in the gradient's own
+    dtype, upcast to ``master_dtype`` only for the AdamW step) right after its
     reduce-scatter *during backward* and the GPU copy is freed immediately, so the GPU never holds
     the full sharded gradient and the D2H transfer overlaps the rest of backward instead of
     running as one bulk copy after it. Micro-batch accumulation happens on CPU; clipping computes

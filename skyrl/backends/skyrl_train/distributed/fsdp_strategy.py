@@ -128,7 +128,7 @@ class FSDPStrategy(DistributedStrategy):
         self._cpu_master: dict = {}
 
         # stream_grads_to_cpu (ZeRO-Offload-style): per-name pinned CPU gradient accumulators
-        # (master_dtype), filled by per-parameter hooks that fire right after each FSDP2
+        # (in the gradient's dtype), filled by per-parameter hooks that fire right after each FSDP2
         # reduce-scatter during backward. `_cpu_grad_filled` holds names written since the last
         # optimizer step (first write is a plain D2H copy, later micro-batches go through a pinned
         # staging buffer + CPU add on `_grad_add_pool`). See _stream_grad_hook.
@@ -382,7 +382,9 @@ class FSDPStrategy(DistributedStrategy):
             # Already on CPU (streamed during backward, drained + clipped in optimizer_step): bind
             # the pinned accumulators as the masters' grads. grad_copy below then measures ~0.
             for name in self._cpu_grad_filled:
-                self._cpu_master[name].grad = self._cpu_grad[name]
+                master = self._cpu_master[name]
+                accum = self._cpu_grad[name]
+                master.grad = accum if accum.dtype == master.dtype else accum.to(master.dtype)
         else:
             for name, param in model.named_parameters():
                 if param.grad is None:
@@ -517,12 +519,15 @@ class FSDPStrategy(DistributedStrategy):
         if self.stream_grads:
             # Persistent pinned gradient accumulators (pinned so the per-layer D2H copies in
             # _stream_grad_hook are truly async). Hooks are attached lazily in backward().
+            # Kept in the gradient's own dtype (FSDP2 hands back grads in the sharded param's
+            # dtype), i.e. micro-batches accumulate at the same precision as the bulk-copy path's
+            # GPU accumulation; upcast to master_dtype only when AdamW consumes them.
             from concurrent.futures import ThreadPoolExecutor
 
-            self._cpu_grad = {
-                name: torch.zeros(m.shape, dtype=master_dtype, pin_memory=True)
-                for name, m in self._cpu_master.items()
-            }
+            self._cpu_grad = {}
+            for name, param in fsdp_module.named_parameters():
+                local = param.to_local() if isinstance(param, DTensor) else param
+                self._cpu_grad[name] = torch.zeros(local.shape, dtype=local.dtype, pin_memory=True)
             self._cpu_grad_staging = {}
             self._cpu_grad_filled = set()
             self._grad_hooked_ids = set()

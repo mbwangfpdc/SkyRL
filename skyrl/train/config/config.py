@@ -232,8 +232,11 @@ class OptimizerConfig(BaseConfig):
     dtype, upcast to ``master_dtype`` only for the AdamW step) right after its
     reduce-scatter *during backward* and the GPU copy is freed immediately, so the GPU never holds
     the full sharded gradient and the D2H transfer overlaps the rest of backward instead of
-    running as one bulk copy after it. Micro-batch accumulation happens on CPU; clipping computes
-    the global norm from the CPU buffers (one scalar NCCL all-reduce). Matches the ZeRO-Offload
+    running as one bulk copy after it. Micro-batch accumulation uses ZeRO-Offload's
+    accumulate-via-GPU (running CPU sum copied back per tensor, added on GPU, copied out), so
+    backward does no CPU arithmetic; the clip norm comes from per-tensor norms taken on the GPU
+    in the same hook (one scalar NCCL all-reduce), and the clip is fused into the single
+    grad -> ``master_dtype`` pass before the CPU AdamW step. Matches the ZeRO-Offload
     paper's placement (Ren et al., 2021) except that the CPU step is ``torch.optim.AdamW``, not
     DeepSpeed's SIMD CPU-Adam, and there is no delayed parameter update."""
 

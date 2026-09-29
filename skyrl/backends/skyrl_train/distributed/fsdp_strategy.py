@@ -130,14 +130,16 @@ class FSDPStrategy(DistributedStrategy):
         # stream_grads_to_cpu (ZeRO-Offload-style): per-name pinned CPU gradient accumulators
         # (in the gradient's dtype), filled by per-parameter hooks that fire right after each FSDP2
         # reduce-scatter during backward. `_cpu_grad_filled` holds names written since the last
-        # optimizer step (first write is a plain D2H copy, later micro-batches go through a pinned
-        # staging buffer + CPU add on `_grad_add_pool`). See _stream_grad_hook.
+        # optimizer step; `_grad_sqnorm` the matching squared L2 norms of the accumulated grads
+        # (0-dim fp32 GPU tensors, taken in the hook while the running sum is on the GPU);
+        # `_cpu_grad_for_master` persistent master_dtype buffers the clipped grads land in for the
+        # AdamW step (only when the grad dtype differs from master_dtype). See _stream_grad_hook.
         self._cpu_grad: dict = {}
-        self._cpu_grad_staging: dict = {}
         self._cpu_grad_filled: set = set()
+        self._grad_sqnorm: dict = {}
+        self._cpu_grad_for_master: dict = {}
         self._grad_hooked_ids: set = set()
-        self._grad_add_pool = None
-        self._grad_add_futures: list = []
+        self._stream_clip_coef: float = 1.0
 
         self.time_steps = defaultdict(int)
 
@@ -159,7 +161,7 @@ class FSDPStrategy(DistributedStrategy):
 
         self.device_mesh = create_device_mesh(world_size=self.world_size, fsdp_size=self.fsdp_config.fsdp_size)
         if self.stream_grads and self.device_mesh.ndim != 1:
-            # _clip_streamed_grads sums local squared norms over the world group, which assumes
+            # _streamed_grad_norm sums local squared norms over the world group, which assumes
             # every rank holds a disjoint shard; HSDP replicas would be counted multiple times.
             raise NotImplementedError(
                 "optimizer_config.stream_grads_to_cpu=True supports pure FSDP only (fsdp_size=-1 or world_size)."
@@ -200,9 +202,6 @@ class FSDPStrategy(DistributedStrategy):
     def backward(self, loss: torch.Tensor, model, optimizer: optim.Optimizer, **kwargs) -> None:
         """Perform backward pass"""
         if self.stream_grads:
-            # Previous micro-batch's CPU adds must finish before this backward's hooks overwrite
-            # the staging buffers they read from.
-            self._wait_grad_adds()
             self._ensure_grad_stream_hooks(model)
         loss.backward()
 
@@ -230,71 +229,67 @@ class FSDPStrategy(DistributedStrategy):
 
         FSDP2's foreach_reduce invokes sharded params' post-accumulate-grad hooks inside
         `with stream(post_reduce_stream)`, i.e. on the stream that produced the reduce-scatter
-        output, so the D2H copy is ordered after the reduction without extra syncs. Dropping
-        param.grad releases the GPU reduce-scatter output; its memory is only reused by later ops
-        on that same stream, which run after this copy -- the same reasoning FSDP2's own
+        output, so everything below is ordered after the reduction without extra syncs, and
+        consecutive micro-batches' copies of the same accumulator are ordered with each other.
+        Dropping param.grad (and `running`) releases GPU memory that is only reused by later ops
+        on that same stream, which run after these copies -- the same reasoning FSDP2's own
         CPUOffloadPolicy relies on to free the GPU gradient without waiting for its D2H copy.
+
+        Micro-batch accumulation uses ZeRO-Offload's accumulate-via-GPU: the running CPU sum is
+        brought back one tensor at a time, added on the GPU and copied out again, so backward
+        does no CPU arithmetic (a CPU add of the whole gradient per micro-batch measured ~3.5x
+        slower fwd+bwd) and the sum is bit-identical to FSDP2's own on-GPU accumulation.
         """
         grad = param.grad
         if grad is None:
             return
         local = grad.to_local() if isinstance(grad, DTensor) else grad
+        local = local.detach()
         accum = self._cpu_grad[name]
         if name not in self._cpu_grad_filled:
-            accum.copy_(local.detach(), non_blocking=True)
+            running = local
             self._cpu_grad_filled.add(name)
         else:
-            # Accumulating micro-batch: the CPU add depends on the copy, so land it in a pinned
-            # staging buffer and do the add on a CPU worker thread once the copy's event fires.
-            staging = self._cpu_grad_staging.get(name)
-            if staging is None:
-                staging = torch.empty_like(accum, pin_memory=True)
-                self._cpu_grad_staging[name] = staging
-            staging.copy_(local.detach(), non_blocking=True)
-            event = torch.cuda.current_stream().record_event()
-            self._grad_add_futures.append(self._grad_add_pool.submit(self._cpu_grad_add, event, accum, staging))
+            running = accum.to(local.device, non_blocking=True)
+            running.add_(local)
+        accum.copy_(running, non_blocking=True)
+        self._grad_sqnorm[name] = torch.linalg.vector_norm(running, dtype=torch.float32).square()
         param.grad = None
 
-    @staticmethod
-    def _cpu_grad_add(event, accum: torch.Tensor, staging: torch.Tensor) -> None:
-        event.synchronize()
-        accum.add_(staging)
-
-    def _wait_grad_adds(self) -> None:
-        futures, self._grad_add_futures = self._grad_add_futures, []
-        for f in futures:
-            f.result()
-
     def _drain_grad_stream(self) -> None:
-        """Make every streamed gradient visible on CPU: pending D2H copies and CPU adds."""
+        """Make every streamed gradient visible on CPU (all D2H copies complete)."""
         torch.cuda.synchronize()
-        self._wait_grad_adds()
+
+    def _reset_grad_stream(self) -> None:
+        self._cpu_grad_filled.clear()
+        self._grad_sqnorm.clear()
+        self._stream_clip_coef = 1.0
 
     def scale_streamed_grads(self, scale: float) -> None:
         """In-place scale of the CPU gradient accumulators (the GPU .grad is always None here)."""
         self._drain_grad_stream()
         for name in self._cpu_grad_filled:
             self._cpu_grad[name].mul_(scale)
+            self._grad_sqnorm[name] = self._grad_sqnorm[name] * (scale * scale)
 
-    def _clip_streamed_grads(self) -> torch.Tensor:
-        """Global-L2-norm clip over the CPU gradient shards; returns the pre-clip norm (on GPU).
+    def _streamed_grad_norm(self) -> torch.Tensor:
+        """Global pre-clip L2 norm of the streamed gradients (on GPU); records the clip coefficient.
 
-        FSDP2 shards are disjoint across ranks (padding is not part of the local tensors), so the
-        global squared norm is the sum of per-rank local squared norms.
+        Uses the per-tensor squared norms the hooks took on the GPU, so no CPU pass over the
+        gradients is needed. FSDP2 shards are disjoint across ranks (padding is not part of the
+        local tensors), so the global squared norm is the sum of per-rank local squared norms.
+        The coefficient is applied later, fused into the grad -> master_dtype pass of
+        _cpu_adam_step.
         """
-        filled = [self._cpu_grad[n] for n in self._cpu_grad_filled]
-        local_sq = torch.zeros((), dtype=torch.float64)
-        if filled:
-            norms = torch._foreach_norm(filled, 2.0)
-            local_sq = torch.stack([n.double() for n in norms]).pow(2).sum()
-        total_sq = local_sq.to(torch.cuda.current_device())
+        device = torch.cuda.current_device()
+        sq = [self._grad_sqnorm[n] for n in self._cpu_grad_filled]
+        total_sq = torch.stack(sq).sum() if sq else torch.zeros((), dtype=torch.float32, device=device)
         if dist.is_initialized():
             dist.all_reduce(total_sq, op=dist.ReduceOp.SUM)
-        total_norm = total_sq.sqrt().float()
+        total_norm = total_sq.sqrt()
+        self._stream_clip_coef = 1.0
         if self.max_norm > 0 and torch.isfinite(total_norm):
-            clip_coef = self.max_norm / (total_norm.item() + 1e-6)
-            if clip_coef < 1.0 and filled:
-                torch._foreach_mul_(filled, clip_coef)
+            self._stream_clip_coef = min(1.0, self.max_norm / (total_norm.item() + 1e-6))
         return total_norm
 
     def optimizer_step(
@@ -311,9 +306,10 @@ class FSDPStrategy(DistributedStrategy):
             model = model.model
 
         if self.stream_grads:
-            # Gradients already live on CPU (the GPU model's .grad is None); norm/clip there.
+            # Gradients already live on CPU (the GPU model's .grad is None); the norm comes from
+            # the hooks' GPU-side squared norms, the clip is applied in _cpu_adam_step.
             self._drain_grad_stream()
-            grad_norm = self._clip_streamed_grads()
+            grad_norm = self._streamed_grad_norm()
         elif self.max_norm > 0:
             # NOTE (sumanthrh): All `grad_norm`s returned here are the original grad norms before clipping.
             if FSDPModule is not None and isinstance(model, FSDPModule):
@@ -336,7 +332,7 @@ class FSDPStrategy(DistributedStrategy):
                 for _, param in model.named_parameters():
                     param.grad = None
                 # Streamed accumulators: forget them so the next backward overwrites, not adds.
-                self._cpu_grad_filled.clear()
+                self._reset_grad_stream()
             return grad_norm
 
         if self.cpu_adam:
@@ -379,12 +375,28 @@ class FSDPStrategy(DistributedStrategy):
         _t0 = time.time()
         device = torch.cuda.current_device()
         if self.stream_grads:
-            # Already on CPU (streamed during backward, drained + clipped in optimizer_step): bind
-            # the pinned accumulators as the masters' grads. grad_copy below then measures ~0.
+            # Already on CPU (streamed during backward, drained in optimizer_step): one fused
+            # clip-and-upcast pass into master_dtype buffers, then bind them as the masters' grads.
+            # The multiply happens in the grad dtype and is cast on store, like the bulk-copy
+            # path's GPU clip followed by its upcasting D2H copy.
+            coef = self._stream_clip_coef
             for name in self._cpu_grad_filled:
                 master = self._cpu_master[name]
                 accum = self._cpu_grad[name]
-                master.grad = accum if accum.dtype == master.dtype else accum.to(master.dtype)
+                if accum.dtype == master.dtype:
+                    if coef != 1.0:
+                        accum.mul_(coef)
+                    master.grad = accum
+                    continue
+                buf = self._cpu_grad_for_master.get(name)
+                if buf is None:
+                    buf = torch.empty_like(master)
+                    self._cpu_grad_for_master[name] = buf
+                if coef != 1.0:
+                    torch.mul(accum, coef, out=buf)
+                else:
+                    buf.copy_(accum)
+                master.grad = buf
         else:
             for name, param in model.named_parameters():
                 if param.grad is None:
@@ -401,9 +413,9 @@ class FSDPStrategy(DistributedStrategy):
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
-        # set_to_none: unbinds the accumulators from the masters; the buffers stay in _cpu_grad.
+        # set_to_none: unbinds the buffers from the masters; they stay in _cpu_grad(_for_master).
         optimizer.zero_grad()
-        self._cpu_grad_filled.clear()
+        self._reset_grad_stream()
         _t2 = time.time()
 
         with torch.no_grad():
@@ -522,16 +534,13 @@ class FSDPStrategy(DistributedStrategy):
             # Kept in the gradient's own dtype (FSDP2 hands back grads in the sharded param's
             # dtype), i.e. micro-batches accumulate at the same precision as the bulk-copy path's
             # GPU accumulation; upcast to master_dtype only when AdamW consumes them.
-            from concurrent.futures import ThreadPoolExecutor
-
             self._cpu_grad = {}
             for name, param in fsdp_module.named_parameters():
                 local = param.to_local() if isinstance(param, DTensor) else param
                 self._cpu_grad[name] = torch.zeros(local.shape, dtype=local.dtype, pin_memory=True)
-            self._cpu_grad_staging = {}
-            self._cpu_grad_filled = set()
+            self._cpu_grad_for_master = {}
             self._grad_hooked_ids = set()
-            self._grad_add_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="grad_add")
+            self._reset_grad_stream()
             logger.info(
                 f"[stream_grads] rank={self.get_rank()}: pinned CPU grad accumulators for "
                 f"{len(self._cpu_grad)} params "

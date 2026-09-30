@@ -1,5 +1,6 @@
 import math
 import os
+import time
 import shutil
 from collections import defaultdict
 from dataclasses import asdict
@@ -114,6 +115,9 @@ class RayPPOTrainer:
         callbacks: Optional[List[TrainingCallback]] = None,
     ):
         self.cfg = cfg
+        from skyrl.utils.stack_sampler import start_stack_sampler
+
+        start_stack_sampler("trainer")
         self.colocate_all = cfg.trainer.placement.colocate_all
         self.tracker = tracker
         self.tokenizer = tokenizer
@@ -1420,12 +1424,21 @@ class RayPPOTrainer:
             # serialization is amortized off the dispatch critical path across mini-batches. The
             # staged chunks use the same partition as `_execute_training_step`'s `stage_data`, so
             # the packing — and resulting logprobs/values — match what forward_backward recomputes.
+            _t0 = time.time()
             all_chunk_refs = self.dispatch.stage_data(model, data_fwd_pass, mini_batch_boundaries)
+            _t1 = time.time()
+            logger.info(f"[stall-debug] fwd {model}: stage_data {_t1 - _t0:.2f}s, dispatch forward")
             combined_outputs: List[Dict[str, Any]] = []
             for chunk_refs in all_chunk_refs:
                 mb_output = self.dispatch.forward_from_staged(model, chunk_refs)
                 combined_outputs.extend(mb_output.loss_fn_outputs)
-            return loss_fn_outputs_to_tensor(combined_outputs, key=key)
+            _t2 = time.time()
+            out = loss_fn_outputs_to_tensor(combined_outputs, key=key)
+            logger.info(
+                f"[stall-debug] fwd {model}: forward returned after {_t2 - _t1:.2f}s, "
+                f"loss_fn_outputs_to_tensor {time.time() - _t2:.2f}s (shape {tuple(out.shape)})"
+            )
+            return out
 
         output = self.dispatch.forward(model, data_fwd_pass)
         return loss_fn_outputs_to_tensor(output.loss_fn_outputs, key=key)
@@ -1678,22 +1691,31 @@ class RayPPOTrainer:
             Dict of reduced metrics from training
         """
         boundaries = data.metadata[f"{model}_mini_batch_boundaries"]
+        _t0 = time.time()
 
         if model == "policy":
             # Normalize advantages for policy training; critic training does not need this
             prompt_boundaries = data.metadata.get("policy_prompt_boundaries")
             data = self._normalize_advantages(data, boundaries, prompt_boundaries)
+        _t1 = time.time()
 
         all_metrics: Dict[str, List[float]] = defaultdict(list)
 
         # Pre-stage all per-DP mini-batch chunks in the object store so that
         # serialization is fully off the critical path during training.
         all_chunk_refs = self.dispatch.stage_data(model, data, boundaries)
+        logger.info(
+            f"[stall-debug] train {model}: normalize_advantages {_t1 - _t0:.2f}s stage_data {time.time() - _t1:.2f}s "
+            f"(batch {tuple(data['sequences'].shape)}, response_length {data.metadata.get('response_length')})"
+        )
 
         # Training loop over epochs and mini-batches
         for _epoch in range(self.cfg.trainer.update_epochs_per_batch):
             for chunk_refs in all_chunk_refs:
+                _t2 = time.time()
+                logger.info(f"[stall-debug] train {model}: dispatch forward_backward")
                 status = self.dispatch.forward_backward_from_staged(model, chunk_refs)
+                logger.info(f"[stall-debug] train {model}: forward_backward returned after {time.time() - _t2:.2f}s")
                 for k, v in status.metrics.items():
                     all_metrics[k].append(v)
 

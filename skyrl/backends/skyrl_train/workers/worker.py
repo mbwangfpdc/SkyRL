@@ -91,6 +91,9 @@ class DistributedTorchRayActor:
         self._world_size = world_size
         self._rank = rank
         self._local_rank = local_rank
+        from skyrl.utils.stack_sampler import start_stack_sampler
+
+        start_stack_sampler(f"{type(self).__name__}-rank{rank}")
         self._master_addr = master_addr if master_addr else self._get_current_node_ip()
         self._master_port = master_port if master_port else self._get_free_port()
         os.environ["MASTER_ADDR"] = self._master_addr
@@ -855,10 +858,16 @@ class PolicyWorkerBase(Worker):
             :class:`WorkerOutput` with per-sample ``loss_fn_outputs`` and scalar
             ``metrics`` (all-reduced across DP).
         """
+        _entry = time.time()
+        logger.info(f"[stall-debug] worker rank={self._rank} forward_backward entered ({len(data)} samples)")
         microbatch_iterator = get_microbatch_iterator(
             data,
             micro_batch_size=self.cfg.micro_train_batch_size_per_gpu,
             max_tokens_per_microbatch=self.cfg.max_tokens_per_microbatch,
+        )
+        logger.info(
+            f"[stall-debug] worker rank={self._rank} forward_backward iterator ready after "
+            f"{time.time() - _entry:.2f}s ({len(microbatch_iterator)} microbatches)"
         )
         all_metrics = defaultdict(list)
         all_loss_fn_outputs = []  # Handle separately from scalar metrics
@@ -1221,17 +1230,25 @@ class PolicyWorkerBase(Worker):
             # Uses token-based micro-batching when `max_tokens_per_microbatch > 0`, otherwise
             # falls back to fixed sample-count chunking. `reorder_and_combine_batches` restores
             # the original sample order (and strips padding) for the token-based iterator.
+            _entry = time.time()
             microbatch_iterator = get_microbatch_iterator(
                 data,
                 micro_batch_size=self.cfg.micro_forward_batch_size_per_gpu,
                 max_tokens_per_microbatch=self.cfg.max_tokens_per_microbatch,
             )
+            _t1 = time.time()
             outputs = [self._forward_micro_batch(micro_batch) for micro_batch in microbatch_iterator]
+            _t2 = time.time()
             output = microbatch_iterator.reorder_and_combine_batches(outputs)
             if output.device is not None and output.device != torch.device("cpu"):
                 output = output.to("cpu")
             row_tensor = output["output"]
             loss_fn_outputs = [{"logprobs": row_tensor[i].tolist()} for i in range(row_tensor.shape[0])]
+            logger.info(
+                f"[stall-debug] worker rank={self._rank} forward: iterator {_t1 - _entry:.2f}s "
+                f"({len(microbatch_iterator)} microbatches), compute {_t2 - _t1:.2f}s, "
+                f"to-lists {time.time() - _t2:.2f}s (rows {tuple(row_tensor.shape)})"
+            )
             return WorkerOutput(loss_fn_outputs=loss_fn_outputs, metrics={})
 
         micro_batch_size = self.cfg.micro_forward_batch_size_per_gpu

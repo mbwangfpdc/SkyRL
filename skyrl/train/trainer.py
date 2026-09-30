@@ -419,6 +419,8 @@ class RayPPOTrainer:
                         # 3. Convert GeneratorOutput to TrainingInputBatch
                         with Timer("convert_to_training_input", self.all_timings):
                             training_input: TrainingInputBatch = self.convert_to_training_input(generator_output, uids)
+                            if self.cfg.trainer.dp_token_balance:
+                                training_input = self._balance_dp_tokens(training_input)
 
                         # 4. Inference and calculate values, log probs, rewards, kl divergence
                         with Timer("fwd_logprobs_values_reward", self.all_timings):
@@ -853,6 +855,63 @@ class RayPPOTrainer:
         """
         self.dispatch.init_weight_sync_state(self.inference_engine_client)
         logger.info("Initialized weight sync state for policy model and inference engines.")
+
+    def _balance_dp_tokens(self, data: TrainingInputBatch) -> TrainingInputBatch:
+        """Reorder each policy mini-batch so its contiguous DP slices hold equal token totals.
+
+        See ``trainer.dp_token_balance``. Greedy longest-first: each sample goes to the least-loaded
+        rank that still has room (every rank keeps exactly ``mini_batch_size / dp_size`` samples,
+        which MeshDispatch's equal-size chunking requires). Per-sample tensors and the per-sample
+        ``uids`` / ``is_last_step`` metadata are permuted together; mini-batch boundaries are
+        unchanged because samples never leave their mini-batch.
+        """
+        algo = self.cfg.trainer.algorithm
+        if algo.loss_reduction in ("prompt_mean", "token_mean_legacy"):
+            raise ValueError(f"trainer.dp_token_balance is incompatible with loss_reduction={algo.loss_reduction!r}")
+        if self.cfg.trainer.critic.model.path is not None or self.cfg.generator.step_wise_trajectories:
+            raise ValueError("trainer.dp_token_balance does not support a critic or step-wise trajectories")
+
+        dp_size = self.dispatch.get_lcm_dp_size()
+        lengths = data["attention_mask"].sum(dim=1).tolist()
+        perm = list(range(len(lengths)))
+        before, after = [], []
+        for start, end in data.metadata["policy_mini_batch_boundaries"]:
+            n = end - start
+            if n % dp_size:
+                continue
+            k = n // dp_size
+            load = [0] * dp_size
+            parts: List[List[int]] = [[] for _ in range(dp_size)]
+            for i in sorted(range(start, end), key=lambda i: -lengths[i]):
+                r = min((r for r in range(dp_size) if len(parts[r]) < k), key=load.__getitem__)
+                parts[r].append(i)
+                load[r] += lengths[i]
+            perm[start:end] = [i for p in parts for i in p]
+            before.append(max(sum(lengths[start + r * k : start + (r + 1) * k]) for r in range(dp_size)) / (sum(load) / dp_size))
+            after.append(max(load) / (sum(load) / dp_size))
+
+        idx = torch.tensor(perm, dtype=torch.long)
+        for key in list(data.keys()):
+            value = data[key]
+            if isinstance(value, torch.Tensor):
+                data[key] = value[idx.to(value.device)]
+            elif value is not None:  # TensorList
+                data[key] = value[idx]
+        for key in ("uids", "is_last_step"):
+            if data.metadata.get(key) is not None:
+                data.metadata[key] = [data.metadata[key][i] for i in perm]
+        if before:
+            self.all_metrics.update(
+                {
+                    "trainer/dp_token_imbalance_before": max(before),
+                    "trainer/dp_token_imbalance_after": max(after),
+                }
+            )
+            logger.info(
+                f"[dp_token_balance] max/mean rank tokens: {max(before):.3f} -> {max(after):.3f} "
+                f"over {len(before)} mini-batch(es), dp_size={dp_size}"
+            )
+        return data
 
     def convert_to_training_input(self, generator_output: GeneratorOutput, uids: List[str]) -> TrainingInputBatch:
         """Converts lists to a padded batch of tensors for training

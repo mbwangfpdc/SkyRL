@@ -1463,6 +1463,15 @@ class TrainerConfig(BaseConfig):
     This makes the microbatch packing — and therefore the resulting logprobs/values — identical to
     what forward_backward recomputes, so the PPO ratio (and critic value clipping) is exact at the
     first inner step."""
+    dp_token_balance: bool = False
+    """Reorder each policy mini-batch so its contiguous per-DP-rank slices carry equal token totals
+    (equal sample counts too). Every DP rank packs its own slice into ``max_tokens_per_microbatch``
+    microbatches, and FSDP runs each microbatch's collectives in lockstep, so with the default
+    contiguous slices each microbatch costs as much as the heaviest rank's, and lighter ranks
+    fill the gap with padding microbatches. Balancing the slices removes that wait. Samples are
+    only moved within a mini-batch, together with ``uids``, so advantages and the ``token_mean`` /
+    ``sequence_mean`` loss reductions are unchanged. Rejected with position-dependent reductions
+    (``prompt_mean``, ``token_mean_legacy``), a critic, or step-wise trajectories."""
     update_ref_every_epoch: bool = False
     """Re-sync the reference model from the policy model at every epoch boundary."""
     remove_microbatch_padding: bool = True

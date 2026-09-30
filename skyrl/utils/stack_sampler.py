@@ -27,17 +27,22 @@ def start_stack_sampler(tag: str) -> None:
     path = os.path.join(out_dir, f"{tag}-{os.getpid()}.log")
     main_ident = threading.main_thread().ident
 
+    me = threading.get_ident()
+
     def run():
         with open(path, "a", buffering=1) as f:
             while True:
                 time.sleep(interval)
-                frame = sys._current_frames().get(main_ident)
-                if frame is None:
-                    continue
-                stack = traceback.extract_stack(frame)[-8:]
-                where = " <- ".join(
-                    f"{os.path.basename(s.filename)}:{s.name}:{s.lineno}" for s in reversed(stack)
-                )
-                f.write(f"{time.time():.1f} {where}\n")
+                names = {t.ident: t.name for t in threading.enumerate()}
+                now = time.time()
+                for ident, frame in sys._current_frames().items():
+                    if ident == me:
+                        continue
+                    stack = traceback.extract_stack(frame)[-8:]
+                    where = " <- ".join(
+                        f"{os.path.basename(s.filename)}:{s.name}:{s.lineno}" for s in reversed(stack)
+                    )
+                    tname = "main" if ident == main_ident else names.get(ident, str(ident))
+                    f.write(f"{now:.1f} [{tname}] {where}\n")
 
     threading.Thread(target=run, name="skyrl-stack-sampler", daemon=True).start()

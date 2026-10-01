@@ -1022,6 +1022,10 @@ class PolicyWorkerBase(Worker):
                 torch.cuda.synchronize()
                 _t1 = time.time()
                 _perf["fwd"] = _perf.get("fwd", 0.0) + (_t1 - _t0)
+            if old_action_log_probs is None and self.cfg.algorithm.on_policy_old_logprobs:
+                # One policy update per batch: the old policy is the current one, so its logprobs
+                # are this forward's own (detached) -> PPO ratio exactly 1, on-policy gradient.
+                old_action_log_probs = action_log_probs.detach()
             # loss function
             # TODO: recompute advantages
             policy_loss, loss_metrics = current_loss_fn(

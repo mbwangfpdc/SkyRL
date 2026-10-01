@@ -1457,6 +1457,10 @@ class RayPPOTrainer:
         keyed by policy_loss_type and cannot distinguish the two CISPO anchors.
         """
         algorithm = self.cfg.trainer.algorithm
+        if algorithm.on_policy_old_logprobs:
+            # Single policy update per batch (checked in validate_cfg): the worker uses the training
+            # forward's detached logprobs as the old ones.
+            return True
         if algorithm.policy_loss_type == PolicyLossType.CISPO:
             # CISPO reads old logprobs only with the default "old" anchor; "rollout" optimizes against
             # the rollout logprobs (like rollout_is) and never touches them.

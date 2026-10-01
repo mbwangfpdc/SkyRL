@@ -936,6 +936,15 @@ class AlgorithmConfig(BaseConfig):
     Only used when ``zero_variance_filter=True``. Defaults to 1e-6 so float (LLM-judge) rewards that are
     effectively identical are still treated as zero-variance; this is a no-op for integer rewards (e.g.
     0/1) where the spread is either 0 or >= 1. Set to 0.0 for exact equality."""
+    on_policy_old_logprobs: bool = False
+    """Skip the policy forward pass that recomputes the "old" logprobs before training and use the
+    training forward's own logprobs (detached) as the old ones. Exact when each batch gets a single
+    policy update (one mini-batch, ``update_epochs_per_batch == 1``): the old policy then IS the
+    current one, so the PPO ratio is exactly 1, clipping never activates and the gradient is the
+    on-policy ``-A * grad log p`` -- the recompute pass only reproduces it up to its own packing
+    and rounding, at the cost of a full forward over the batch. Rejected by ``validate_cfg``
+    unless those conditions hold, the policy loss reads old logprobs, and the KL reward penalty
+    and off-policy correction are off."""
     lambd: float = 1.0
     """Lambda parameter for GAE."""
     gamma: float = 1.0

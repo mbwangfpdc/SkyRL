@@ -285,6 +285,25 @@ def validate_cfg(cfg: SkyRLTrainConfig):
         if cfg.trainer.max_training_steps <= 0:
             raise ValueError(f"max_training_steps must be > 0, got {cfg.trainer.max_training_steps}")
 
+    if cfg.trainer.algorithm.on_policy_old_logprobs:
+        from skyrl.backends.skyrl_train.utils.off_policy_correction_utils import off_policy_correction_enabled
+        from skyrl.backends.skyrl_train.utils.ppo_utils import LOSSES_WITHOUT_OLD_LOGPROBS
+
+        algo = cfg.trainer.algorithm
+        problems = []
+        if cfg.trainer.policy_mini_batch_size != cfg.trainer.train_batch_size:
+            problems.append("policy_mini_batch_size must equal train_batch_size (one policy update per batch)")
+        if cfg.trainer.update_epochs_per_batch != 1:
+            problems.append("update_epochs_per_batch must be 1")
+        if algo.policy_loss_type in LOSSES_WITHOUT_OLD_LOGPROBS:
+            problems.append(f"policy_loss_type={algo.policy_loss_type!r} does not use old logprobs")
+        if algo.use_kl_in_reward:
+            problems.append("use_kl_in_reward reads the old logprobs before training")
+        if off_policy_correction_enabled(algo.off_policy_correction):
+            problems.append("off_policy_correction reads the old logprobs")
+        if problems:
+            raise ValueError("trainer.algorithm.on_policy_old_logprobs: " + "; ".join(problems))
+
     # Validate generation config separately
     validate_generator_cfg(cfg)
 

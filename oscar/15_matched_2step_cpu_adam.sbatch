@@ -1,7 +1,7 @@
 #!/bin/bash
 # Functional smoke test for the new optimizer_config.cpu_adam mode
 # (skyrl/backends/skyrl_train/distributed/fsdp_strategy.py, branch
-# cpu-adam-optimizer, worktree /oscar/scratch/mborjigi/skyrl/SkyRL-cpu-adam,
+# cpu-adam-optimizer, worktree /oscar/data/deeptir/mborjigi/skyrl/SkyRL-cpu-adam,
 # commit 10040db9). Not a throughput comparison -- just: does it train
 # correctly, and are the per-step overheads where the design says they
 # should be (grad_copy/writeback small & PCIe-bound, step_cpu CPU-bound and
@@ -61,12 +61,12 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=768g
 #SBATCH --time=01:00:00
-#SBATCH --output=/oscar/scratch/mborjigi/skyrl/logs/%x-%j.out
+#SBATCH --output=/oscar/data/deeptir/mborjigi/skyrl/logs/%x-%j.out
 #SBATCH --mail-type=END,FAIL,TIME_LIMIT_90
 #SBATCH --mail-user=mbwang@brown.edu
 
 set -euo pipefail
-source /oscar/scratch/mborjigi/skyrl/env.sh
+source /oscar/data/deeptir/mborjigi/skyrl/env.sh
 skyrl_set_jobtmp
 
 # Test the cpu-adam-optimizer worktree's code, not the main checkout.

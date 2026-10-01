@@ -13,7 +13,7 @@
 #SBATCH --mem=64g
 #SBATCH --time=00:10:00
 #SBATCH --exclude=gpu2709,gpu3006,gpu3005
-#SBATCH --output=/oscar/scratch/mborjigi/skyrl/logs/%x-%j.out
+#SBATCH --output=/oscar/data/deeptir/mborjigi/skyrl/logs/%x-%j.out
 echo "node=$(hostname)"
 echo "--- numactl -H"; numactl -H 2>&1 | head -30
 echo "--- job cpuset: $(cat /proc/self/status | grep Cpus_allowed_list)"

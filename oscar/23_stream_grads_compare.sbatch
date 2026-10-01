@@ -12,11 +12,11 @@
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=64g
 #SBATCH --time=00:20:00
-#SBATCH --output=/oscar/scratch/mborjigi/skyrl/logs/%x-%j.out
+#SBATCH --output=/oscar/data/deeptir/mborjigi/skyrl/logs/%x-%j.out
 
 set -euo pipefail
 : "${OUT:?set OUT=<results dir>}"
-SRC=/oscar/scratch/mborjigi/skyrl/SkyRL-zero-offload
+SRC=/oscar/data/deeptir/mborjigi/skyrl/SkyRL-zero-offload
 TMPD="/tmp/${USER}-stream-grads-cmp-${SLURM_JOB_ID}"
 mkdir -p "$TMPD"
 trap 'rm -rf "$TMPD"' EXIT

@@ -8,7 +8,7 @@
 # AdamW masters+moments); same random ~200M Qwen2, same data, 3 steps x 3 micro-batches, clipping
 # active. Results -> $OUT/{MODE}_rank{r}.pt; 23_stream_grads_compare.sbatch compares the two.
 #
-# Self-contained on purpose: /oscar/scratch/mborjigi/skyrl/env.sh and the shared venv's torch
+# Self-contained on purpose: /oscar/data/deeptir/mborjigi/skyrl/env.sh and the shared venv's torch
 # sources were deleted by the 2026-09-27 scratch purge, so this builds a throwaway venv on
 # node-local /tmp from the worktree's uv.lock (no Ray, no Apptainer needed for this check).
 # vllm-router is skipped: its only wheel needs glibc 2.35 (host has 2.34) and this check never
@@ -25,14 +25,14 @@
 #SBATCH --mem=64g
 #SBATCH --time=00:30:00
 #SBATCH --exclude=gpu2709,gpu3006
-#SBATCH --output=/oscar/scratch/mborjigi/skyrl/logs/%x-%j.out
+#SBATCH --output=/oscar/data/deeptir/mborjigi/skyrl/logs/%x-%j.out
 
 # Usage: sbatch --export=ALL,MODE=cpu_adam,OUT=<dir>[,SEQ_LEN=4096][,TAG=cpu_adam2] 22_stream_grads_equivalence.sbatch
 
 set -euo pipefail
 : "${MODE:?set MODE=cpu_adam|stream}"
 : "${OUT:?set OUT=<results dir>}"
-SRC=/oscar/scratch/mborjigi/skyrl/SkyRL-zero-offload
+SRC=/oscar/data/deeptir/mborjigi/skyrl/SkyRL-zero-offload
 TMPD="/tmp/${USER}-stream-grads-${SLURM_JOB_ID}"
 mkdir -p "$TMPD"
 trap 'rm -rf "$TMPD"' EXIT

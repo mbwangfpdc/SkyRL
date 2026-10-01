@@ -22,10 +22,10 @@
 #SBATCH --mem=400g
 #SBATCH --time=03:00:00
 #SBATCH --exclude=gpu2709,gpu3006,gpu3005
-#SBATCH --output=/oscar/scratch/mborjigi/skyrl/logs/%x-%j.out
+#SBATCH --output=/oscar/data/deeptir/mborjigi/skyrl/logs/%x-%j.out
 
 set -uo pipefail
-source /oscar/scratch/mborjigi/skyrl/env.sh
+source /oscar/data/deeptir/mborjigi/skyrl/env.sh
 skyrl_set_jobtmp
 SRC="$SKYRL_ROOT/SkyRL-pinned"
 BENCH="$SKYRL_ROOT/bench/train_path_bench.py"

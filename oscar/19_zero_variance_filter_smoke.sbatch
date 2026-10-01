@@ -55,12 +55,12 @@
 #SBATCH --mem=768g
 #SBATCH --time=01:00:00
 #SBATCH --exclude=gpu2709,gpu3006
-#SBATCH --output=/oscar/scratch/mborjigi/skyrl/logs/%x-%j.out
+#SBATCH --output=/oscar/data/deeptir/mborjigi/skyrl/logs/%x-%j.out
 #SBATCH --mail-type=END,FAIL,TIME_LIMIT_90
 #SBATCH --mail-user=mbwang@brown.edu
 
 set -euo pipefail
-source /oscar/scratch/mborjigi/skyrl/env.sh
+source /oscar/data/deeptir/mborjigi/skyrl/env.sh
 skyrl_set_jobtmp
 
 SRC="$SKYRL_ROOT/SkyRL"

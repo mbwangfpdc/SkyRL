@@ -1,7 +1,12 @@
 # Shared configuration for running SkyRL on Oscar under Apptainer.
 # Sourced by every 0*.sbatch script and by shell.sh. Not executable on its own.
 
-SKYRL_ROOT=/oscar/scratch/mborjigi/skyrl
+# Code, scripts, logs, the SIF and any checkpoints live on /oscar/data (moved off purge-prone
+# scratch 2026-10-01). Regenerable, file-count-heavy state (venv, uv cache, uv python, container
+# HOME) lives on scratch under CACHE_ROOT -- /oscar/data has a group file-count quota; rebuild it
+# with 24_rebuild_env_pinned_check.sbatch if a purge takes it.
+SKYRL_ROOT=/oscar/data/deeptir/mborjigi/skyrl
+CACHE_ROOT=/oscar/scratch/mborjigi/skyrl-cache
 
 # --- container -------------------------------------------------------------
 # The published SkyRL FSDP image. It is only a toolchain (Anyscale Ray 2.56.0 +
@@ -18,13 +23,13 @@ SKYRL_COMMIT=bce9ee9a80fbd262db44c79d5af12291ced5492d
 
 # The venv lives outside the checkout: uv's docs recommend it, and it lets us
 # delete/rebuild deps without disturbing the source tree.
-VENV="$SKYRL_ROOT/venv"
+VENV="$CACHE_ROOT/venv"
 
 # Writable HOME inside the container. Deliberately NOT /home/ray -- binding
 # over /home/ray would hide the image's own anaconda3 and ~/.local/bin/uv.
-CHOME="$SKYRL_ROOT/home"
-UV_CACHE="$SKYRL_ROOT/uv-cache"
-UV_PY="$SKYRL_ROOT/uv-python"
+CHOME="$CACHE_ROOT/home"
+UV_CACHE="$CACHE_ROOT/uv-cache"
+UV_PY="$CACHE_ROOT/uv-python"
 
 # uv is installed into the image at this fixed path (Dockerfile runs the
 # astral installer as user `ray`). Referenced absolutely so we never depend on
@@ -54,7 +59,7 @@ skyrl_set_jobtmp() {
     if [ -n "${SLURM_JOB_ID:-}" ] && [ -d "/jobtmp/$USER" ]; then
         JOBTMP="$(readlink -f /jobtmp/$USER)/skyrl-$SLURM_JOB_ID"
     else
-        JOBTMP="$SKYRL_ROOT/tmp/local-$$"
+        JOBTMP="$CACHE_ROOT/tmp/local-$$"
     fi
     mkdir -p "$JOBTMP/tmp" "$JOBTMP/ray"
     export JOBTMP

@@ -37,7 +37,7 @@ Code changes live on branch `dp-token-balance`; each is behind a flag.
 | 6 | `gc.freeze()` after policy-worker init | env `SKYRL_GC_FREEZE=1` | Removes a 20–180 s training-start stall (ranks starting the training call staggered) | `8998145f` |
 | 7 | In-process prompt loading | `data.dataloader.num_workers=0` | Removes ~60 s worker respawn at every epoch boundary (every 2 steps here) | config only |
 
-Launch script with everything: `/oscar/scratch/mborjigi/skyrl/34_parity_final.sbatch`.
+Launch script with everything: `/oscar/data/deeptir/mborjigi/skyrl/34_parity_final.sbatch`.
 
 ## Notes
 

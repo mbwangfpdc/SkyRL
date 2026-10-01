@@ -199,6 +199,11 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         # Created only on profiled ranks.
         self.profiler = build_profiler_from_policy_cfg(self.cfg)
 
+        from skyrl.utils.gc_debug import freeze_after_init, log_threads
+
+        freeze_after_init(f"policy-rank{self._rank}")
+        log_threads(f"policy-rank{self._rank}")
+
     async def init_weight_sync_state(self, inference_engine_client, inference_engine_cfg: "InferenceEngineConfig"):
         # Call super first to set _transfer_strategy_cls and create sender/receivers
         await super().init_weight_sync_state(inference_engine_client, inference_engine_cfg)

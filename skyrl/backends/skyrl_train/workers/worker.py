@@ -94,6 +94,9 @@ class DistributedTorchRayActor:
         from skyrl.utils.stack_sampler import start_stack_sampler
 
         start_stack_sampler(f"{type(self).__name__}-rank{rank}")
+        from skyrl.utils.gc_debug import install as _gc_debug_install
+
+        _gc_debug_install(f"{type(self).__name__}-rank{rank}")
         self._master_addr = master_addr if master_addr else self._get_current_node_ip()
         self._master_port = master_port if master_port else self._get_free_port()
         os.environ["MASTER_ADDR"] = self._master_addr

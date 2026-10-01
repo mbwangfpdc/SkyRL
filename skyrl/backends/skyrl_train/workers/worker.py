@@ -350,12 +350,18 @@ class Worker(DistributedTorchRayActor):
             backload_optimizer: Whether to backload optimizer state (no-op when there is no optimizer).
             backload_model: Whether to backload model parameters.
         """
+        _t0 = time.time()
+        logger.info(
+            f"[stall-debug] worker rank={self._rank} backload_to_gpu start "
+            f"(model={backload_model}, optimizer={backload_optimizer})"
+        )
         self.strategy.backload_to_gpu(
             self._get_module_for_offload(),
             self.optimizer,
             backload_optimizer=backload_optimizer,
             backload_model=backload_model,
         )
+        logger.info(f"[stall-debug] worker rank={self._rank} backload_to_gpu done in {time.time() - _t0:.2f}s")
 
     def get_cuda_memory(self) -> Dict[str, Any]:
         """Get CUDA memory usage on worker's CUDA device."""

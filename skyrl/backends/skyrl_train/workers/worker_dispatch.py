@@ -392,8 +392,14 @@ class WorkerDispatch:
             :class:`WorkerOutput` with per-sample ``loss_fn_outputs`` aggregated
             across DP ranks plus scalar ``metrics`` (already all-reduced).
         """
+        import time as _time
+
+        from loguru import logger as _logger
+
+        _t0 = _time.time()
         self._ensure_on_gpu(model, need_optimizer=True, need_model=True)
         self.ensure_active_adapter(model, model_id)
+        _logger.info(f"[stall-debug] dispatch {model}: _ensure_on_gpu {_time.time() - _t0:.2f}s, dispatching forward_backward")
 
         # Only pass kwargs that are not None (critic worker doesn't accept loss_fn)
         kwargs = dict(worker_kwargs)
